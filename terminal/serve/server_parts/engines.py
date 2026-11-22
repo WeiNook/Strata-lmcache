@@ -20,6 +20,7 @@ from strata_control import reader_room
 from strata_control import gpu_roles
 
 from serve.server_parts.base import ENGINE_SILENCE_S
+from serve.lmcache_status import view as lmcache_view
 
 
 class Engine(Protocol):
@@ -401,11 +402,19 @@ def conversation_slots(engine) -> int | None:
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
-    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
+    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
+
+    `lmcache` is the shared tier above it (docs/LMCACHE.md): a separate store on its own port, so it can be off while
+    the engine runs.  It is reported here so the card can say what the instance shares with the other instances of this
+    model; `serve.lmcache_status` polls it off the request path and never raises."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
+    try:
+        shared = lmcache_view()
+    except Exception:                       # a monitor never fails the page it reports on
+        shared = {"available": False, "configured": False}
     return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
-            "slots": info.get("conversation_cache_slots"), **parked,
+            "slots": info.get("conversation_cache_slots"), **parked, "lmcache": shared,
             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,

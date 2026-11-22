@@ -39,7 +39,13 @@ COPY . .
 ARG CUDA_ARCHITECTURES="75;80;86;89;120"
 ARG BUILD_VISION=1
 ARG ENGINE_VERSION=
-RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r terminal/requirements.txt -r terminal/requirements-build.txt
+# Where this stage's Python packages come from (the default is PyPI, which pip would use anyway). A build host that
+# cannot reach PyPI quickly can name a mirror instead of routing pip through a proxy:
+#     --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+# The Terminal's own wheel install below is hash-locked and runs isolated, so it does not read this; an offline build
+# passes --wheelhouse to tools/packaging/package_terminal.py instead.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r terminal/requirements.txt -r terminal/requirements-build.txt
 # ggml comes from the vendored engine/third_party/strata-ggml; strata-vision is Strata's own reader (terminal/tools/vision/own): nothing is downloaded
 RUN set -e; \
     real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \

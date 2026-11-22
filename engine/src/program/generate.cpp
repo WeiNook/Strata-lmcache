@@ -24,6 +24,7 @@
 #include "strata/core/prompt_checkpoint_grid.hpp"
 #include "strata/core/reader_room.hpp"
 #include "strata/core/residency_trim.hpp"
+#include "strata/core/lmcache_tier.hpp"
 #include "strata/core/kfd_settle.hpp"
 #include "strata/core/kfd_quiet.hpp"
 #include "strata/core/kpack_path.hpp"
@@ -1292,6 +1293,14 @@ void usage() {
                  "                       if that branch is revisited)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                 "  shared conversation cache (docs/LMCACHE.md), all by environment, off until the first is set:\n"
+                 "    STRATA_LMCACHE=tcp://host:5555   the store's data plane; empty = the tier is off\n"
+                 "    STRATA_LMCACHE_HTTP=...          its report plane for the monitor (default: <same host>:8080)\n"
+                 "    STRATA_LMCACHE_NAMESPACE=...     the name this model registers under (default: \"strata\")\n"
+                 "    STRATA_LMCACHE_MIN_TOKENS=N      do not publish prefixes shorter than this (default 8192)\n"
+                 "    STRATA_LMCACHE_REPLACE_RAM=1     the store replaces the in-process cache: publish each finished\n"
+                 "                       conversation and keep nothing here (--conversation-cache-mib 0 makes it complete)\n"
+                 "    STRATA_LMCACHE_BYTES_PER_TOKEN=N the state's bytes per token, which fixes the object shape (default 19531)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -13577,13 +13586,75 @@ int main(int argc, char** argv) {
         // for the disk.  It stays in RAM (and the physical-RAM gate sees it) until this thread takes it back from the writer:
         // freed (spill_reclaim), or reused as it is when the next request wants it (the restore below).  The RAM gate's own
         // evictions wait for the writer, so the memory they free shows up in the reading.
+        // The shared tier above the SSD one (docs/LMCACHE.md): the same session image, published to an LMCache store so
+        // another engine - or this one after a restart - can pick it up instead of reading the prompt again.  Off unless
+        // STRATA_LMCACHE names a store.  Publishing happens on the background writer, so a request never waits for it,
+        // and every failure only costs the reuse: the store is never on the request path's critical side.
+        std::unique_ptr<strata::core::LmcacheTier> lmcache_tier;
+        std::mutex lmcache_mu;   // one store connection, used from the writer thread and from the serve loop
+        if (const auto lc = strata::core::lmcache_settings(); lc.enabled) {
+            const std::string name = lc.model.empty() ? std::string("strata") : lc.model;
+            const int64_t instance = (int64_t) (std::chrono::steady_clock::now().time_since_epoch().count() & 0x7fffffff);
+            lmcache_tier = std::make_unique<strata::core::LmcacheTier>(
+                lc, strata::core::lmcache_zmq_store(lc.rpc, name, lc.bytes_per_token, instance));
+            std::fprintf(stderr, "strata serve: shared cache: %s",
+                         strata::core::lmcache_info_line(lc, lmcache_tier->stats()).c_str());
+        }
+        // STRATA_LMCACHE_REPLACE_RAM: the store takes the place of the in-process conversation cache.  Nothing is kept
+        // in this process, so several engines on one host stop holding one copy each; every reuse then costs a store
+        // round trip instead of a buffer handoff (docs/LMCACHE.md, "Do I still need the RAM tier?").
+        const bool lmcache_primary = lmcache_tier != nullptr && lmcache_tier->settings().replace_ram;
+        // Publish one parked image; never throws, never fails the caller.  The store's session is bound to the same
+        // identity the SSD tier uses, computed here when that tier is off (a host without an NVMe disk).
+        auto lmcache_publish = [&](const strata::core::SavedConversation& img, const char* why) {
+            if (!lmcache_tier || img.live.ids.empty()) return;
+            try {
+                if (!spill_id) {
+                    std::string e;
+                    strata::core::SessionFileIdentity id;
+                    if (!session_identity(id, e, {})) {
+                        std::fprintf(stderr, "strata serve: shared cache: not published (%s): the model cannot be "
+                                             "fingerprinted (%s)\n", why, e.c_str());
+                        return;
+                    }
+                    spill_id = id;
+                }
+                std::string e;
+                std::vector<int32_t> ids(img.live.ids.begin(), img.live.ids.end());
+                std::lock_guard<std::mutex> lk(lmcache_mu);
+                const auto t0 = Clock::now();
+                if (lmcache_tier->publish(img, *spill_id, ids, e)) {
+                    std::fprintf(stderr, "strata serve: shared cache: published %zu tokens (%s) in %.1f ms; %s", ids.size(),
+                                 why, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 strata::core::lmcache_info_line(lmcache_tier->settings(), lmcache_tier->stats()).c_str());
+                } else {
+                    std::fprintf(stderr, "strata serve: shared cache: not published (%s): %s\n", why, e.c_str());
+                }
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: shared cache: not published (%s): out of memory\n", why);
+            }
+        };
         std::optional<strata::core::BackgroundWriter<strata::core::SavedConversation>> spill_writer;
-        if (spill.enabled()) {
-            spill_writer.emplace([&](const strata::core::SavedConversation& s) { return spill_write(s, "evicted from RAM, written in the background"); },
-                                 [] { strata::core::spill_detail::lower_thread_priority(); });   // (it gives way to the serve loop)
+        // A host without an NVMe disk runs with the SSD tier off; the shared tier must still get its feed, so it gets a
+        // writer of its own then (the two are exclusive: one image is never queued twice, and never copied).
+        std::optional<strata::core::BackgroundWriter<strata::core::SavedConversation>> share_writer;
+        if (spill.enabled() && !lmcache_primary) {
+            spill_writer.emplace([&](const strata::core::SavedConversation& s) {
+                    const uint64_t serial = spill_write(s, "evicted from RAM, written in the background");
+                    if (serial) lmcache_publish(s, "evicted from RAM, written in the background");   // (the shared tier, off unless configured)
+                    return serial;
+                },
+                [] { strata::core::spill_detail::lower_thread_priority(); });   // (it gives way to the serve loop)
             conversations.set_evict_sink([&](strata::core::SavedConversation&& v) {
                 if (spill_ready(v, "evicted from RAM")) spill_writer->push(std::move(v));
             });
+        } else if (lmcache_tier) {
+            share_writer.emplace([&](const strata::core::SavedConversation& s) {
+                    lmcache_publish(s, "evicted from RAM");
+                    return uint64_t{0};
+                },
+                [] { strata::core::spill_detail::lower_thread_priority(); });
+            conversations.set_evict_sink([&](strata::core::SavedConversation&& v) { share_writer->push(std::move(v)); });
         }
         // the writer's written images, freed here (they are on the SSD tier); the bytes freed
         auto spill_reclaim = [&]() -> size_t {
@@ -13886,6 +13957,18 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
+                if (lmcache_primary && share_writer) {
+                    // published on the writer's thread and kept nowhere here: the RAM this capture used goes back
+                    // as soon as the transfer is done, and the next request - on any instance - reads it from the store
+                    const size_t captured = image.bytes();
+                    const size_t tokens = src.ids.size();
+                    const auto t1 = Clock::now();
+                    share_writer->push(std::move(image));
+                    std::fprintf(stderr, "strata serve: shared cache: handed %zu tokens (%zu MiB) to the store instead of the RAM tier "
+                                         "in %.1f ms\n", tokens, captured >> 20,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t1).count());
+                    return true;
+                }
                 auto mem_after = strata::core::sample_host_memory();
                 // (the park pools' idle memory is the first RAM to go back here too: a park the check refuses with the pools held would pass without them)
                 if (!strata::core::conversation_memory_admit(
@@ -13922,7 +14005,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if ((!conversations.enabled() && !lmcache_primary) || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
@@ -18714,6 +18797,71 @@ int main(int argc, char** argv) {
                 }   // (the other written ones are freed here: they are on the SSD tier)
             }
             spill_reclaim();   // what the writer finished meanwhile is on the SSD tier: its RAM goes back before this request parks
+            // The shared tier above the SSD one (docs/LMCACHE.md): a sibling engine, or this one before a restart, may
+            // already hold this prefix.  The store's session carries its hashes and its identity, both checked before
+            // the image is used, so a stale or foreign entry is refused here rather than restored.
+            if (!from_ssd && lmcache_tier && stages.empty() && !ids.empty()) {
+                strata::core::SessionFileIdentity lc_id;
+                std::string le;
+                bool have_id = false;
+                try {
+                    if (spill_id) {
+                        lc_id = *spill_id;
+                        have_id = true;
+                    } else {
+                        have_id = session_identity(lc_id, le, {});
+                    }
+                } catch (...) {
+                    have_id = false;
+                }
+                if (have_id) {
+                    const auto t0 = Clock::now();
+                    strata::core::SavedConversation image;
+                    std::string why;
+                    bool got = false;
+                    try {
+                        strata::core::SessionReadLimits limits;
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        pools_budget.shrink((size_t) -1);
+                        limits.admit = [floor, &o](uint64_t need, std::string& w) {
+                            const auto mem = strata::core::sample_host_memory();
+                            if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
+                                                                        need, floor)) return true;
+                            w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " + ram_note(mem) + ")";
+                            return false;
+                        };
+                        const std::vector<int32_t> lc_ids(ids.begin(), ids.end());
+                        if (strata::core::conversation_session_read_limits(limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
+                                (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why)) {
+                            std::lock_guard<std::mutex> lk(lmcache_mu);
+                            got = lmcache_tier->restore(lc_ids, lc_id, image, limits, why);
+                        }
+                    } catch (const std::bad_alloc&) {
+                        why = "not enough RAM to read it";
+                    }
+                    if (got) {
+                        // Only when it gives THIS prompt a longer start than the RAM tier already does: a stale, short
+                        // entry in the store must never displace a longer state the engine already holds.
+                        const auto matched = strata::core::conversation_image_prefix(image, ids, req_imgs, want_cvec);
+                        const int64_t floor_tokens = std::max({resume, slot_tokens, parked.tokens});
+                        if (matched.first > floor_tokens) {
+                            std::fprintf(stderr, "strata serve: shared cache: read %zu tokens back in %.1f ms (this prompt "
+                                                 "starts with %lld of them); %s", image.live.ids.size(),
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                         (long long) matched.first,
+                                         strata::core::lmcache_info_line(lmcache_tier->settings(), lmcache_tier->stats()).c_str());
+                            from_ssd = true;   // (the state came from outside RAM: nothing else is taken for this request)
+                            incoming.emplace(std::move(image));
+                            taken = strata::core::ConversationCache::Match{SIZE_MAX, matched.first, matched.second, 0};
+                        } else {
+                            std::fprintf(stderr, "strata serve: shared cache: dropped a restored session (%lld of this prompt) "
+                                                 "in favour of the RAM tier's %lld\n", (long long) matched.first,
+                                         (long long) floor_tokens);
+                        }
+                    }
+                }
+            }
             if (!from_ssd && spill.enabled() && spill.size() > 0 && stages.empty()) {
                 const auto sp = spill.best(ids, req_imgs, want_cvec);
                 const auto sp_entry = sp.tokens > 0 ? spill.find(sp.serial) : std::nullopt;

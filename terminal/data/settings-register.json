@@ -17686,6 +17686,267 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_LMCACHE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/lmcache_tier.cpp",
+     "line": 50,
+     "backend": "cuda-hip",
+     "fn": "env_text"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 75
+    },
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 111
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/LMCACHE.md:58",
+    "docs/LMCACHE.md:64",
+    "docs/LMCACHE.md:65",
+    "docs/LMCACHE.md:208"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "shared L1 tier above the conversation cache: the LMCache MP server, tcp://host:5555; empty = off",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_LMCACHE_BYTES_PER_TOKEN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/lmcache_tier.cpp",
+     "line": 58,
+     "backend": "cuda-hip",
+     "fn": "env_int"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 93
+    },
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 104
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/LMCACHE.md:68"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "the state's bytes per token, which fixes the object shape; both ends must agree",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_LMCACHE_HTTP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/lmcache_tier.cpp",
+     "line": 53,
+     "backend": "cuda-hip",
+     "fn": "env_text"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 86
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/LMCACHE.md:65",
+    "docs/LMCACHE.md:208"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "that store's report plane, read by the monitor; derived from STRATA_LMCACHE when unset",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_LMCACHE_MIN_TOKENS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/lmcache_tier.cpp",
+     "line": 60,
+     "backend": "cuda-hip",
+     "fn": "env_int"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 92
+    },
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 103
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/LMCACHE.md:69",
+    "docs/LMCACHE.md:112"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "cost gate: shorter prefixes are not published (default 8192, at least one chunk)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_LMCACHE_NAMESPACE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/lmcache_tier.cpp",
+     "line": 55,
+     "backend": "cuda-hip",
+     "fn": "env_text"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 91
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/LMCACHE.md:59",
+    "docs/LMCACHE.md:66",
+    "docs/LMCACHE.md:222"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "the model name this engine registers with the store; empty = \"strata\"",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_LMCACHE_REPLACE_RAM",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/lmcache_tier.cpp",
+     "line": 61,
+     "backend": "cuda-hip",
+     "fn": "env_int"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [
+    {
+     "file": "engine/src/core/lmcache_tier_test.cpp",
+     "line": 94
+    }
+   ],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/LMCACHE.md:67",
+    "docs/LMCACHE.md:168",
+    "docs/LMCACHE.md:175"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "core",
+   "note": "1: the store replaces the in-process cache (publish each finished conversation, keep nothing here)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_LM_HIP",
    "backends": [
     "hip"

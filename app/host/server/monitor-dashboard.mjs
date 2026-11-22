@@ -37,6 +37,9 @@ export function originalDashboard(raw, hardware, fallback) {
     history:samples.length?samples:fallback.history,requests,
     totals:totals?{...fallback.totals,requests:totals.requests??0,tokensIn:totals.prompt_tokens??0,tokensOut:totals.output_tokens??0,cachedTokens:totals.reused??0,uncachedTokens:(totals.prompt_tokens??0)-(totals.reused??0),promptMs:totals.prompt_ms,decodeMs:totals.decode_ms,since:totals.since?new Date(totals.since*1000).toISOString():fallback.totals.since}:fallback.totals,
     conversationCache:cache?{source:'engine',enabled:cache.enabled,parked:cache.parked,slots:cache.slots,memoryGb:gb(cache.bytes),budgetGb:finite(cache.budget_mib)?cache.budget_mib/1024:null,parks:cache.parks,restores:cache.restores,evictions:cache.evictions,lastEvent:cache.last_event,lastAt:cache.last_at,lastTokens:cache.last_tokens,requests:cache.requests,requestsReused:cache.requests_reused,lastPrompt:cache.last_prompt,lastReused:cache.last_reused}:fallback.conversationCache,
+    // The shared L1 tier above the conversation cache: LMCache's own report, already reduced by lmcache-status.mjs
+    // (it is a separate store on a separate port, so it is polled separately and may be off while the engine runs).
+    lmcacheCache:raw.lmcache&&typeof raw.lmcache==='object'?raw.lmcache:(fallback.lmcacheCache??{available:false}),
     mcp:raw.mcp?{tools:raw.mcp.tools,servers:(raw.mcp.servers??[]).map(server=>({name:server.name,state:server.status,transport:server.transport,info:server.info,error:server.error,tools:(server.tools??[]).map(tool=>({name:tool.tool??tool.name,description:tool.description}))}))}:undefined,
     telemetry:{...fallback.telemetry,throughput:'engine',context:'reported',memory:'engine',thermals:'engine'},
   };

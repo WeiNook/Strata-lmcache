@@ -80,7 +80,9 @@ uint64_t load64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v;
 // 1.2 GB session neither evicts other files nor is charged to the engine's memory cgroup), buffered I/O otherwise
 // (tmpfs, a filesystem that refuses an aligned direct transfer, or STRATA_SESSION_BUFFERED=1).  Windows and other
 // systems: ordinary buffered I/O, same blocks.
-constexpr size_t kAlign = 4096, kBlock = 16u << 20;
+constexpr size_t kAlign = 4096, kBlock = kSessionBlock;
+// the public constants describe the file these functions write: they cannot drift from it
+static_assert(kSessionHeaderBytes == 64 && kSessionTrailerBytes == 16, "format v1: 64-byte header, 16-byte trailer");
 #ifdef _WIN32
 struct AlignedFree { void operator()(uint8_t* p) const { _aligned_free(p); } };
 using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
@@ -525,19 +527,25 @@ bool free_space(const std::string& path, uint64_t& out) {
 }
 #endif
 
-class FileSink {
+class FileSink : public SessionSink {
 public:
     explicit FileSink(RawFile& f) : buf_(aligned_block()), f_(f) {}
-    bool ok() const { return buf_ != nullptr; }
-    std::string error() const {
+    bool ok() const override { return buf_ != nullptr; }
+    std::string error() const override {
         if (!buf_) return "out of memory for the write buffer";
         return fault_ ? fault_msg_ : f_.error();
     }
-    SessionError kind() const { return buf_ ? (fault_ ? fault_kind_ : f_.kind()) : SessionError::memory; }
+    SessionError kind() const override { return buf_ ? (fault_ ? fault_kind_ : f_.kind()) : SessionError::memory; }
+    // the transfer starts: its length is known and (with progress) is announced as 0 of it
+    bool begin(uint64_t total_bytes) override {
+        expected = total_bytes;
+        if (progress) (*progress)(0, expected);
+        return true;
+    }
     // room in the block for in-place production (avoids a staging copy)
-    uint8_t* span(size_t& room) { room = kBlock - used_; return buf_.get() + used_; }
-    bool commit(size_t n) { used_ += n; total_ += n; return used_ < kBlock || drain(); }
-    bool write(const void* p, size_t n) {
+    uint8_t* span(size_t& room) override { room = kBlock - used_; return buf_.get() + used_; }
+    bool commit(size_t n) override { used_ += n; total_ += n; return used_ < kBlock || drain(); }
+    bool write(const void* p, size_t n) override {
         const uint8_t* s = static_cast<const uint8_t*>(p);
         while (n) {
             size_t room = 0;
@@ -550,7 +558,7 @@ public:
         return true;
     }
     // last block padded to the alignment for direct I/O, then the file cut back to its exact size and flushed
-    bool finish(bool durable) {
+    bool finish(bool durable) override {
         if (!f_.is_open()) return false;
         if (fault_) { f_.close(); return false; }
         const size_t padded = f_.direct() ? (used_ + kAlign - 1) / kAlign * kAlign : used_;
@@ -586,13 +594,19 @@ private:
     uint64_t total_ = 0;
 };
 
-class FileSource {
+class FileSource : public SessionSource {
 public:
-    explicit FileSource(RawFile& f) : buf_(aligned_block()), f_(f) {}
-    bool ok() const { return buf_ != nullptr; }
-    std::string error() const { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
-    SessionError kind() const { return buf_ ? f_.kind() : SessionError::memory; }
-    bool read(void* p, size_t n) {
+    FileSource(RawFile& f, uint64_t size) : buf_(aligned_block()), f_(f), size_(size) {}
+    bool ok() const override { return buf_ != nullptr; }
+    std::string error() const override { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
+    SessionError kind() const override { return buf_ ? f_.kind() : SessionError::memory; }
+    // the length the caller already took from the opened descriptor, so the stream parse re-checks that same number
+    bool begin(uint64_t& total_bytes) override {
+        expected_ = size_;
+        total_bytes = size_;
+        return true;
+    }
+    bool read(void* p, size_t n) override {
         uint8_t* d = static_cast<uint8_t*>(p);
         while (n) {
             if (at_ == have_ && !fill()) return false;
@@ -603,7 +617,6 @@ public:
         return true;
     }
     std::optional<Ticker> progress;
-    uint64_t expected = 0;
 private:
     bool fill() {
         at_ = have_ = 0;
@@ -616,18 +629,18 @@ private:
         }
         const uint64_t before = total_;
         total_ += have_;
-        if (progress && total_ > before) (*progress)(total_, expected);
+        if (progress && total_ > before) (*progress)(total_, expected_);
         return have_ > 0;
     }
     Aligned buf_;
     RawFile& f_;
     size_t at_ = 0, have_ = 0;
-    uint64_t total_ = 0;
+    uint64_t size_ = 0, expected_ = 0, total_ = 0;
 };
 
-// ---- serialization: the same walk counts (f == nullptr) and writes
+// ---- serialization: the same walk counts (f == nullptr) and writes, to a file or to any other sink
 struct Out {
-    FileSink* f = nullptr;
+    SessionSink* f = nullptr;
     SessionHasher* hash = nullptr;
     uint64_t n = 0;
     bool ok = true, overflow = false;
@@ -709,7 +722,7 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
 struct In {
-    FileSource* f;
+    SessionSource* f;
     SessionHasher hash;
     uint64_t left;
     std::string& error;
@@ -1024,21 +1037,62 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
 }
 
 namespace {
-bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
-                const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                SessionStatus& st) {
-    st = {};
-    st.error = SessionError::invalid;   // refusals before any disk access
+// The exact length of the stream for `image`, or why this state cannot be saved at all - a refusal no sink can lift,
+// so a file and a network tier refuse the same states with the same words.
+bool stream_length(const SavedConversation& image, const std::vector<SessionKvSource>* sources, uint64_t& payload,
+                   uint64_t& total, std::string& error) {
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
-    Out sizing;
+    Out sizing;   // counts only: no byte is produced, no K/V is read
     put_payload(sizing, image, sources);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
         return false;
     }
-    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    payload = sizing.n;
+    total = kHeader + payload + kTrailer;
+    return true;
+}
+
+// One pass over the state into `f`: the header, the payload and the trailer (payload hash, end marker), then the
+// sink's own last step.  `payload` and `total` come from stream_length.  On failure `why` is the reason without a
+// prefix and `kind` is that failure as the caller answers it.
+bool stream_write(SessionSink& f, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                  const SessionFileIdentity& id, uint64_t payload, uint64_t total, bool durable, std::string& why,
+                  SessionError& kind) {
+    if (!f.ok()) { kind = SessionError::memory; why = f.error(); return false; }
+    if (!f.begin(total)) { kind = f.kind(); why = f.error(); return false; }
+    uint8_t h[kHeader];
+    header_bytes(h, id, payload);
+    bool ok = f.write(h, kHeader);
+    SessionHasher hash(0);
+    Out out;
+    out.f = &f;
+    out.hash = &hash;
+    if (ok) put_payload(out, image, sources);
+    ok = ok && out.ok && out.n == payload;
+    if (ok) {
+        const uint64_t ph = hash.digest();
+        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+    }
+    ok = f.finish(durable) && ok;
+    if (!ok) {
+        why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                              : f.error();
+        kind = out.read_failed ? SessionError::io : f.kind();
+    }
+    return ok;
+}
+
+// A file write: the sink is a temporary file beside `path`, and the stream replaces `path` only once it is complete.
+bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+                SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;   // refusals before any disk access
+    uint64_t payload = 0, total = 0;
+    if (!stream_length(image, sources, payload, total, error)) return false;
     st.error = SessionError::io;
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
@@ -1063,37 +1117,20 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
     if (opt.progress) f.progress.emplace(opt.progress);
     f.phase = opt.phase;
-    f.expected = total;
-    if (f.progress) (*f.progress)(0, total);   // the temporary file exists: the transfer starts
     const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
-    uint8_t h[kHeader];
-    header_bytes(h, id, payload);
-    bool ok = f.write(h, kHeader);
-    SessionHasher hash(0);
-    Out out;
-    out.f = &f;
-    out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
-    ok = ok && out.ok && out.n == payload;
-    if (ok) {
-        const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
-    }
-    ok = f.finish(opt.durable) && ok;
     std::string why;
-    if (!ok) {
-        why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
-                              : f.error();
-        st.error = out.read_failed ? SessionError::io : f.kind();
-    } else {
+    SessionError kind = SessionError::io;
+    if (stream_write(f, image, sources, id, payload, total, opt.durable, why, kind)) {
         if (opt.phase) opt.phase("publish", total);
         if (pub.publish(why, opt.durable, st, fault)) {
             st.error = SessionError::none;
             bytes = (size_t) total;
             return true;
         }
+    } else {
+        st.error = kind;
     }
     error = "session file: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
     if (st.published) error += " (the new file has already replaced the old one; its folder entry may not survive a power loss)";
@@ -1171,18 +1208,17 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+// The parse of one stream, from a file or from a network tier: the length it must have, its header, the identity, the
+// payload under the caller's limits, the payload hash and the end marker - in that order, so a stream is refused at
+// the same point, with the same words, as a file of the same bytes.
+bool stream_read(SessionSource& f, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                 std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
-    RawFile raw;
+    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
     uint64_t size = 0;
-    if (!raw.open_session(path, size)) {
-        st.error = raw.refused() ? SessionError::invalid : raw.kind();
-        error = "session file: " + path + ": " + raw.error();
-        return false;
-    }
+    if (!f.begin(size)) { st.error = f.kind(); error = "session file: " + f.error(); return false; }
     if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
     const uint64_t max_size = session_read_max_file_bytes(limits);
     if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
@@ -1190,11 +1226,6 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
         return false;
     }
-    FileSource f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
-    // installed before the first block (the header's) is read: every block reports, the first one included
-    if (limits.progress) f.progress.emplace(limits.progress);
-    f.expected = size;
     uint8_t h[kHeader];
     if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
     uint32_t version = 0, hsize = 0;
@@ -1236,6 +1267,26 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     st.error = SessionError::none;
     return true;
 }
+
+// A file read: open without following a link, check the opened descriptor, then parse the very stream a network tier
+// would deliver - the length the descriptor reported is the number the header is checked against.
+bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+               std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: " + path + ": " + raw.error();
+        return false;
+    }
+    FileSource f(raw, size);
+    // installed before the first block (the header's) is read: every block reports, the first one included
+    if (limits.progress) f.progress.emplace(limits.progress);
+    return stream_read(f, id, image, bytes, error, limits, st);
+}
 } // namespace
 
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
@@ -1246,6 +1297,67 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
         ok = read_impl(path, id, image, bytes, error, limits, st);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+namespace {
+// A stream write: the refusals first (they are about the state, not about where it goes), then the stream itself.
+bool stream_write_public(SessionSink& sink, const SavedConversation& image,
+                         const std::vector<SessionKvSource>* sources, const SessionFileIdentity& id, size_t& bytes,
+                         std::string& error, SessionStatus* status) {
+    SessionStatus st;
+    st.error = SessionError::invalid;
+    bool ok = false;
+    try {
+        uint64_t payload = 0, total = 0;
+        ok = stream_length(image, sources, payload, total, error);
+        if (ok) {
+            st.error = SessionError::io;
+            std::string why;
+            SessionError kind = SessionError::io;
+            // a stream has no temporary name to fall back on, so the trailer must have been stored: `durable`
+            ok = stream_write(sink, image, sources, id, payload, total, true, why, kind);
+            if (ok) {
+                st.error = SessionError::none;
+                st.published = true;   // the trailer was delivered: the sink holds the whole stream
+                bytes = (size_t) total;
+            } else {
+                st.error = kind;
+                error = "session stream: write failed" + (why.empty() ? std::string() : ": " + why);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        error = "session stream: out of memory while writing";
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+} // namespace
+
+bool session_stream_write(SessionSink& sink, const SavedConversation& image, const SessionFileIdentity& id,
+                          size_t& bytes, std::string& error, SessionStatus* status) {
+    return stream_write_public(sink, image, nullptr, id, bytes, error, status);
+}
+
+bool session_stream_write(SessionSink& sink, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                          const SessionFileIdentity& id, size_t& bytes, std::string& error, SessionStatus* status) {
+    return stream_write_public(sink, meta, &kv, id, bytes, error, status);
+}
+
+bool session_stream_read(SessionSource& source, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                         std::string& error, const SessionReadLimits& limits, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = stream_read(source, id, image, bytes, error, limits, st);
+    } catch (const std::bad_alloc&) {
+        error = "session stream: out of memory while reading";
         st.error = SessionError::memory;
         ok = false;
     }

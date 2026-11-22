@@ -8,6 +8,7 @@ import { readTemperatures, stopTemperatures } from './temperature-telemetry.mjs'
 import { addEnergy, energyWh, meteredPowerW, reportedPowerW } from './energy-meter.mjs';
 import { state as servingState } from './serving.mjs';
 import { originalDashboard } from './monitor-dashboard.mjs';
+import { lmcacheSnapshot, startLmcachePolling, httpFromRpc } from './lmcache-status.mjs';
 import { get as getStore } from './store.mjs';
 import * as supervisor from './supervisor.mjs';
 import { clamp, round } from './util.mjs';
@@ -234,6 +235,7 @@ export function snapshot() {
     hardware: hardwareSnapshot(),
     requests: servingState().requests,
     conversationCache: { source: 'unavailable' },
+    lmcacheCache: lmcacheSnapshot(),
     history: state.history,
     totals: { ...state.totals },
     telemetry: { ...state.telemetry, system:systemReading?'sensor':'none' },
@@ -250,7 +252,25 @@ export function snapshot() {
       logCount: engine.logCount,
     },
   };
-  return engine.running&&engineMetrics.source==='engine'&&engineMetrics.dashboard?originalDashboard(engineMetrics.dashboard,cachedHardware()??hwCache,result):result;
+  // The shared tier above the conversation cache reports on its own port: attach the latest sample, and poll it only
+  // while an engine is running and this model has a store configured (no setting: the feature is off, nothing polls).
+  const live = engine.running && engineMetrics.source === 'engine' && engineMetrics.dashboard ? engineMetrics.dashboard : null;
+  if (live) {
+    const cfg = lmcacheStoreFor(live, engine);
+    if (cfg.url) startLmcachePolling(cfg);
+    live.lmcache = lmcacheSnapshot();
+    return originalDashboard(live, cachedHardware() ?? hwCache, result);
+  }
+  return result;
+}
+
+/** Where this model's shared store is: the engine's own report when it has one, then the launcher's environment. */
+function lmcacheStoreFor(raw, engine) {
+  const own = raw?.lmcache_config && typeof raw.lmcache_config === 'object' ? raw.lmcache_config : null;
+  const env = process.env;
+  const url = own?.http || env.STRATA_LMCACHE_HTTP || (env.STRATA_LMCACHE ? httpFromRpc(env.STRATA_LMCACHE) : '');
+  const modelName = own?.namespace || env.STRATA_LMCACHE_NAMESPACE || raw?.engine?.model || engine?.modelId || '';
+  return { url: String(url || ''), modelName: String(modelName || ''), intervalMs: 5000 };
 }
 
 export function setContextMax(max) {

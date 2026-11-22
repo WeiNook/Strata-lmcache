@@ -172,6 +172,15 @@ function LegacyMonitorScreen({ native }: {
     const progress = data.phase === 'reading' ? data.prompt.pct : writing ? percent(data.generation?.done, data.generation?.total) : 0;
     const statusDetail = data.phase === 'reading' && data.prompt.total ? `${tokens(data.prompt.done)} / ${tokens(data.prompt.total)} tokens · ${Math.round(data.prompt.pct)}%` : writing && hasReading(data.generation?.done) ? `${tokens(data.generation.done)} tokens · ${tps(data.outputTps)} tok/s` : last ? `Last: ${tokens(last.tokensOut)} tokens${hasReading(last.tps) ? ` at ${tps(last.tps)} tok/s` : ''}` : '';
     const cache = data.conversationCache;
+    // The shared tier above it: a separate store on its own port, so it can be off while the engine runs.
+    const lmc = data.lmcacheCache;
+    const lmcPool = lmc?.available ? lmc.store ?? null : null;
+    const gbOf = (n?:number|null) => hasReading(n) ? n / 1073741824 : null;
+    const lmcPoolText = lmcPool ? `${number(gbOf(lmcPool.usedBytes), 1)} / ${number(gbOf(lmcPool.totalBytes), 1)} GB` : '';
+    // Only an exclusive pool lets the monitor say "this model" about the store's totals; a shared one says so.
+    const lmcModelText = !lmc?.available ? '' : !lmc.mine?.registered ? tr("Not registered with the store")
+      : lmc.mine.exclusive ? tr("{0} objects · {1} GB", [number(lmc.mine.objects ?? lmcPool?.objects), number(gbOf(lmc.mine.bytes ?? lmcPool?.usedBytes), 1)])
+      : tr("Registered · pool shared with {0} model(s)", [number(lmc.models?.length ?? 1)]);
     const reused = requests.filter(r => hasReading(r.cachedTokens));
     const lastRequest = requests.find(r => r.state === 'done');
     const lastReused = hasReading(lastRequest?.cachedTokens) ? lastRequest : null;
@@ -217,6 +226,8 @@ function LegacyMonitorScreen({ native }: {
     </div>
     <section className="st-card monitor-cache" data-snapshot-skip><div className="section-toolbar"><h2 className="h4">{tr("Conversation cache")}</h2>{tr(lastReused ? <span className="small muted">{tr("{0} of {1} requests reused prompt tokens", [number(cache?.requestsReused ?? reused.filter(r => (r.cachedTokens ?? 0) > 0).length),number(cache?.requests ?? requests.length)])}</span> : null)}</div>
       {tr(cache?.enabled ? <div className="monitor-cache-bars"><div><div className="monitor-bar-reading"><span>{tr("Parked conversations")}</span><span className="muted num">{tr(number(cache.parked))} / {tr(number(cache.slots))}</span></div><ReadingBar label={tr("Parked conversations")} value={percent(cache.parked, cache.slots)}/></div><div><div className="monitor-bar-reading"><span>{tr("Their memory (RAM)")}</span><span className="muted num">{tr(number(cache.memoryGb, 1))} / {tr(number(cache.budgetGb, 1))}{tr(" GB")}</span></div><ReadingBar label={tr("Conversation cache memory")} value={percent(cache.memoryGb, cache.budgetGb)}/></div></div> : null)}
+      {tr(lmc?.available ? <div className="monitor-cache-bars"><div><div className="monitor-bar-reading"><span>{tr("Shared cache (LMCache)")}</span><span className="muted num">{tr(lmcPoolText || '—')}</span></div><ReadingBar label={tr("Shared cache")} value={percent(lmcPool?.usedBytes, lmcPool?.totalBytes)}/></div><div><div className="monitor-bar-reading"><span>{tr("This model")}</span><span className="muted num">{tr(lmcModelText || '—')}</span></div></div></div> : null)}
+      {tr(lmc && !lmc.available ? <p className="xs muted">{tr("Shared cache not reachable")}</p> : null)}
       <dl className="monitor-cache-facts"><div><dt>{tr("Last request")}</dt><dd>{tr(lastCacheText)}</dd></div><div><dt>{tr("Reused since start")}</dt><dd>{tr(hasReading(reusedTotal) ? `${tokens(data.totals.cachedTokens)} tokens` : '—')}</dd></div>{tr(cache?.enabled ? <><div><dt>{tr("Parked / restored")}</dt><dd>{tr(number(cache.parks))} / {tr(number(cache.restores))}{tr(cache.evictions ? ` · ${number(cache.evictions)} evicted` : '')}</dd></div>{tr(cache.lastEvent ? <div><dt>{tr("Last switch")}</dt><dd>{tr(cache.lastEvent === 'parked' ? 'Parked' : 'Restored')} {tr(tokens(cache.lastTokens))}{tr(" tokens")}{tr(cache.lastAt ? ` · ${new Date(cache.lastAt * 1000).toLocaleTimeString(localeTag())}` : '')}</dd></div> : null)}</> : null)}</dl>
       <p className="small muted">{tr(cache?.enabled ? 'Parked conversations resume from their saved state. The oldest is removed when the cache fills.' : lastReused ? 'Follow-up requests can reuse the previous prompt’s cached tokens.' : 'Cache details appear when the engine reports prompt reuse.')}</p>
     </section>

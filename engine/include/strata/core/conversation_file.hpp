@@ -235,6 +235,69 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
+// ---- the same stream, somewhere other than a local file ------------------------------------------------------
+//
+// A session is one self-describing byte stream: the 64-byte header, the payload, the 16-byte trailer (payload hash,
+// end marker).  session_file_write puts it in a file and session_file_read takes it apart in a fail-closed order;
+// the two interfaces below are that stream's two ends, so a network tier above the SSD can carry a conversation with
+// no file involved (docs/LMCACHE.md).  The serialization, the hashes and the order of the checks are the same code,
+// so a stream equals the file byte for byte and the two tiers cannot disagree about what a saved conversation is.
+//
+// A sink is produced into: each K/V layer is read from its owner straight into `span()`, so publishing a 1.2 GB state
+// costs no full host copy.  A source is drained in order - the parse only ever reads forward - which is what lets a
+// reader prefetch the next blocks while it consumes the current one.
+constexpr size_t kSessionBlock = size_t(16) << 20;   // the unit both ends move at a time (the file layer's buffer)
+// Format v1's fixed parts: the 64-byte header a stream starts with and the 16-byte trailer it ends with.  Exposed
+// because a reader that must know a stream's length before it can read it (one whose length is not a file's size)
+// parses the header itself; the header's payload length at offset 32 is what makes a stream self-describing.
+constexpr size_t kSessionHeaderBytes = 64;
+constexpr size_t kSessionTrailerBytes = 16;
+
+class SessionSink {
+public:
+    virtual ~SessionSink() = default;
+    virtual bool ok() const = 0;            // the sink got what it needs to start (it can still fail later)
+    virtual std::string error() const = 0;  // why it is not ok, or why the step that just failed did
+    virtual SessionError kind() const = 0;  // that failure, as the caller's answer
+    // Once, before the first byte: the exact length of the stream that follows (header, payload, trailer).  A sink
+    // that publishes sizes its transfer here and can refuse before any data moves.
+    virtual bool begin(uint64_t total_bytes) = 0;
+    virtual uint8_t* span(size_t& room) = 0;   // room left in the current block, for in-place production
+    virtual bool commit(size_t n) = 0;      // `n` bytes of the span are filled: keep them
+    virtual bool write(const void* p, size_t n) = 0;
+    // the last block, then make the whole thing stick: a file flushes and closes, a publisher waits for the store's
+    // acknowledgement.  `durable` false skips the flush (a temporary file that is only going to be read back).
+    virtual bool finish(bool durable) = 0;
+};
+
+class SessionSource {
+public:
+    virtual ~SessionSource() = default;
+    virtual bool ok() const = 0;
+    virtual std::string error() const = 0;
+    virtual SessionError kind() const = 0;
+    // Once, before the first read: the stream's exact length, so the header's payload length is checked against it
+    // before anything is allocated.  False when the length is not known: the read is then refused.
+    virtual bool begin(uint64_t& total_bytes) = 0;
+    virtual bool read(void* p, size_t n) = 0;   // forward only; exactly `n` bytes or false
+};
+
+// The bytes session_file_write would put in a file, handed to `sink`.  No file is created, so the free-space
+// preflight, the temporary name and the rename do not apply: a sink that publishes owns its own two-phase rule.
+// `bytes` is the stream's length; `status->published` says the trailer was delivered.  The two overloads are the two
+// session_file_write's: the image carries its own K/V, or the layers are pulled from their owners as they go.
+bool session_stream_write(SessionSink& sink, const SavedConversation& image, const SessionFileIdentity& id,
+                          size_t& bytes, std::string& error, SessionStatus* status = nullptr);
+bool session_stream_write(SessionSink& sink, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                          const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                          SessionStatus* status = nullptr);
+
+// Restore from a stream: the same checks in the same order as session_file_read - the stream's length, the header's
+// hash, the identity, the payload length against that length, the RAM preflight, the bounded parse, the payload hash,
+// the end marker - so a stream and a file of the same bytes are accepted or refused identically.
+bool session_stream_read(SessionSource& source, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                         std::string& error, const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).

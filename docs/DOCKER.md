@@ -365,6 +365,10 @@ repository compiles the CUDA 13 engine inside Docker, makes the package and puts
 (`--build-arg CUDA_ARCHITECTURES=89` for one card only, much faster). The source Dockerfile is not the ready-made image's one, so it is
 named with `-f`; the build then takes its ignore list from `tools/docker/Dockerfile.src.dockerignore`. `.git` is not copied into the build,
 so the commit comes in as `STRATA_COMMIT`; without it the Terminal stage stops.
+Where the build host cannot reach PyPI quickly, point this stage's packages at a mirror with
+`--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/` (the Terminal's own hash-locked wheel install installs in isolation and
+ignores it by design; it needs either the network or `--wheelhouse`). The pinned CPython for the Terminal comes from GitHub, so a build host
+that cannot reach GitHub at all still needs a proxy for that one download.
 For a GTX 10, P100 or V100 build the CUDA 12 variant: `docker build -t strata:src-cuda12 --build-arg STRATA_COMMIT=$(git rev-parse HEAD)
 -f tools/docker/Dockerfile.src --build-arg CUDA_IMAGE=nvidia/cuda:12.9.2-devel-ubuntu24.04 --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" .`
 (the build turns on the Pascal / Volta code by itself when an architecture below 75 is listed, and names the package `cuda12` with

@@ -308,6 +308,14 @@ export interface MonitorState {
   history: MonitorSample[];
   requests?: ServeRequest[];
   conversationCache?: { enabled?:boolean; parked?:number; slots?:number; memoryGb?:number; budgetGb?:number; parks?:number; restores?:number; evictions?:number; lastEvent?:string; lastAt?:number; lastTokens?:number; requests?:number;requestsReused?:number;lastPrompt?:number;lastReused?:number; source:string };
+  /** The shared L1 tier above the conversation cache (LMCache), as its own /status reports it. `mine.exclusive` is the
+   * only case where the pool's totals are this model's totals; otherwise they are the store's, shared with other models. */
+  lmcacheCache?: { available:boolean; healthy?:boolean; engine?:string|null; chunkSize?:number|null;
+    store?:{objects:number|null;usedBytes:number|null;totalBytes:number|null;ratio:number|null;backend:string|null};
+    models?:{instanceId:string;modelName:string;blockSize:number|null;worldSize:number|null;useMla:boolean|null}[];
+    mine?:{registered:boolean;instances:number;blockSize:number|null;worldSize:number|null;useMla:boolean|null;
+      exclusive:boolean;shared:boolean;objects:number|null;bytes:number|null};
+    error?:string };
   mcp?: { servers:{ name:string; state:string; transport?:string; info?:{name?:string;version?:string}; error?:string; tools:{name:string;description?:string}[] }[]; tools:number };
   totals: {
     promptMs?: number;

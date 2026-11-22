@@ -10,7 +10,7 @@ debugging and are kept in `terminal/data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (271)
+## Switches you can turn on (277)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -123,6 +123,12 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_KV_PREFETCH` | number | NVIDIA and AMD, Intel Arc | [KV_PREFETCH.md](KV_PREFETCH.md), [README.md](bench-results/README.md), [README.md](bench-results/2026-10-06-community-rtx4090-opt-ins/README.md) |
 | `STRATA_KV_ROT` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md), [SPLIT_SERVE.md](SPLIT_SERVE.md) |
 | `STRATA_LEND_MIRROR` | number | Intel Arc | [INTEL.md](INTEL.md) |
+| `STRATA_LMCACHE` | on / off | NVIDIA and AMD | [LMCACHE.md](LMCACHE.md) |
+| `STRATA_LMCACHE_BYTES_PER_TOKEN` | number | NVIDIA and AMD | [LMCACHE.md](LMCACHE.md) |
+| `STRATA_LMCACHE_HTTP` | on / off | NVIDIA and AMD | [LMCACHE.md](LMCACHE.md) |
+| `STRATA_LMCACHE_MIN_TOKENS` | number | NVIDIA and AMD | [LMCACHE.md](LMCACHE.md) |
+| `STRATA_LMCACHE_NAMESPACE` | text | NVIDIA and AMD | [LMCACHE.md](LMCACHE.md) |
+| `STRATA_LMCACHE_REPLACE_RAM` | on / off | NVIDIA and AMD | [LMCACHE.md](LMCACHE.md) |
 | `STRATA_LM_HIP` | on / off | AMD | - |
 | `STRATA_LOGITS_DUMP` | on / off | NVIDIA and AMD, Intel Arc | [KVA.md](KVA.md) |
 | `STRATA_LOGPOS_TOPK` | number | NVIDIA and AMD, Intel Arc | [QUANTS.md](QUANTS.md), [UNSLOTH_Q4.md](UNSLOTH_Q4.md), [README.md](bench-results/2026-10-03-v100-prompt-attn/README.md) |

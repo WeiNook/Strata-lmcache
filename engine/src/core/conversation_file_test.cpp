@@ -148,6 +148,63 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
     }
     return !ok && !error.empty();
 }
+
+// ---- the stream ends, kept in RAM: what a network tier's sink and source do, minus the network (docs/LMCACHE.md)
+struct RamSink : SessionSink {
+    std::vector<uint8_t> out;
+    bool ok() const override { return true; }
+    std::string error() const override { return {}; }
+    SessionError kind() const override { return SessionError::io; }
+    bool begin(uint64_t total) override {
+        out.clear();
+        out.reserve(size_t(total));
+        return true;
+    }
+    uint8_t* span(size_t& room) override { room = kSessionBlock - used_; return block_.data() + used_; }
+    bool commit(size_t n) override {   // like the file layer: a full block goes out at once
+        used_ += n;
+        if (used_ == kSessionBlock) {
+            out.insert(out.end(), block_.data(), block_.data() + used_);
+            used_ = 0;
+        }
+        return true;
+    }
+    bool write(const void* p, size_t n) override {
+        const uint8_t* s = static_cast<const uint8_t*>(p);
+        while (n) {
+            size_t room = 0;
+            uint8_t* d = span(room);
+            const size_t c = n < room ? n : room;
+            std::memcpy(d, s, c);
+            commit(c);
+            s += c; n -= c;
+        }
+        return true;
+    }
+    bool finish(bool) override {
+        if (used_) out.insert(out.end(), block_.data(), block_.data() + used_);
+        used_ = 0;
+        return true;
+    }
+    std::vector<uint8_t> block_ = std::vector<uint8_t>(kSessionBlock);
+    size_t used_ = 0;
+};
+
+struct RamSource : SessionSource {
+    explicit RamSource(const std::vector<uint8_t>& d) : data(d) {}
+    bool ok() const override { return true; }
+    std::string error() const override { return "the stream ends early"; }
+    SessionError kind() const override { return SessionError::io; }
+    bool begin(uint64_t& total) override { total = data.size(); return true; }
+    bool read(void* p, size_t n) override {
+        if (n > data.size() - at) return false;
+        std::memcpy(p, data.data() + at, n);
+        at += n;
+        return true;
+    }
+    const std::vector<uint8_t>& data;
+    size_t at = 0;
+};
 } // namespace
 
 int main() {
@@ -195,6 +252,95 @@ int main() {
         const fs::path again = dir / "again.bin";
         check(session_file_write(again.string(), original, id, written, error), "second write");
         check(slurp(again) == slurp(good), "format is deterministic");
+    }
+    // a stream IS the file: same bytes, handed to a sink instead of written to one, so a conversation restored from a
+    // network tier cannot depend on which tier it came from
+    {
+        const std::vector<char> file = slurp(good);
+        RamSink sink;
+        size_t streamed = 0;
+        SessionStatus st;
+        check(session_stream_write(sink, original, id, streamed, error, &st), "stream write succeeds");
+        check(st.error == SessionError::none && st.published, "stream write reports the trailer delivered");
+        check(streamed == file.size(), "stream length equals the file's");
+        check(sink.out.size() == file.size() && std::memcmp(sink.out.data(), file.data(), file.size()) == 0,
+              "the stream is byte-identical to the file");
+        SavedConversation back;
+        RamSource src(sink.out);
+        size_t read = 0;
+        check(session_stream_read(src, id, back, read, error), "stream read succeeds");
+        check(read == file.size() && same(original, back), "stream round trip is identical");
+
+        // the same refusals, in the same order: a corrupted payload and a short stream are both refused
+        std::vector<uint8_t> bad = sink.out;
+        bad[bad.size() / 2] ^= 0xff;
+        SavedConversation unused;
+        RamSource corrupt(bad);
+        check(!session_stream_read(corrupt, id, unused, read, error), "a corrupted stream is refused");
+        check(error.find("checksum") != std::string::npos, "the payload hash catches the corruption");
+        const std::vector<uint8_t> shortened(sink.out.begin(), sink.out.end() - 1);
+        RamSource cut(shortened);
+        check(!session_stream_read(cut, id, unused, read, error), "a truncated stream is refused");
+        check(error.find("does not match the header") != std::string::npos, "a truncated stream fails on its length");
+        RamSource other(corrupt.data);
+        SavedConversation keep = original;
+        check(!session_stream_read(other, SessionFileIdentity{id.model, id.config ^ 1}, keep, read, error),
+              "a stream saved with another configuration is refused");
+        check(same(original, keep), "a refused stream leaves the caller's image untouched");
+    }
+    // the K/V source path (each layer read from its owner straight into the sink, no host copy): the bytes are the
+    // same whether they go to a file or to a stream, and every source byte is read exactly once
+    {
+        std::vector<std::array<ConversationBuffer, 5>> parts(2);
+        size_t expected_read = 0;
+        for (size_t layer = 0; layer < parts.size(); ++layer)
+            for (size_t p = 0; p < 5; ++p) {
+                const size_t n = (p == 0 ? (17u << 20) : 1000u + 7u * p) + layer;   // the first part spans blocks
+                parts[layer][p] = pattern(n, uint8_t(layer * 5 + p));
+                expected_read += n;
+            }
+        SavedConversation meta = original;
+        meta.kv.clear();   // the K/V comes from the sources, not from the image
+        size_t read_bytes = 0;
+        std::vector<SessionKvSource> kv;
+        for (size_t layer = 0; layer < parts.size(); ++layer) {
+            SessionKvSource s;
+            s.format = 2 + int(layer); s.cells = 1024; s.heads = 2; s.head_dim = 256;
+            s.page_size = 64; s.pooled_rows = 9; s.idx_dim = 128;
+            for (size_t p = 0; p < 5; ++p) s.sizes[p] = parts[layer][p].size();
+            s.read = [&parts, layer, &read_bytes](size_t part, size_t off, void* dst, size_t n) {
+                read_bytes += n;
+                return parts[layer][part].read(dst, off, n);
+            };
+            kv.push_back(std::move(s));
+        }
+        const fs::path sp = dir / "sources.bin";
+        size_t file_bytes = 0;
+        check(session_file_write(sp.string(), meta, kv, id, file_bytes, error), "write from K/V sources");
+        check(read_bytes == expected_read, "every source byte is read once by the file write");
+
+        RamSink sink;
+        size_t streamed = 0;
+        read_bytes = 0;
+        check(session_stream_write(sink, meta, kv, id, streamed, error), "stream from K/V sources");
+        check(read_bytes == expected_read, "the stream reads the same source bytes");
+        const std::vector<char> from_file = slurp(sp);
+        check(streamed == file_bytes && sink.out.size() == size_t(file_bytes) &&
+              std::memcmp(sink.out.data(), from_file.data(), file_bytes) == 0, "sources: the stream equals the file");
+
+        SavedConversation back;
+        RamSource src(sink.out);
+        size_t read = 0;
+        check(session_stream_read(src, id, back, read, error), "sources: stream read succeeds");
+        check(read == file_bytes && back.kv.size() == parts.size(), "sources: the layers came back");
+        bool kv_ok = back.kv.size() == parts.size();
+        for (size_t layer = 0; kv_ok && layer < parts.size(); ++layer)
+            kv_ok = back.kv[layer].format == 2 + int(layer) && back.kv[layer].k == parts[layer][0] &&
+                    back.kv[layer].v == parts[layer][1] && back.kv[layer].k_scale == parts[layer][2] &&
+                    back.kv[layer].v_scale == parts[layer][3] && back.kv[layer].pooled == parts[layer][4];
+        check(kv_ok, "sources: every K/V part came back byte for byte");
+        check(back.geometry == meta.geometry && back.layer_lo == meta.layer_lo && back.layer_hi == meta.layer_hi &&
+              same_checkpoint(back.live, meta.live), "sources: the running state came back");
     }
     // saving over an existing file replaces it (MoveFileExW on Windows, rename elsewhere)
     {

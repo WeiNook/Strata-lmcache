@@ -403,11 +403,22 @@ function renderConvCache(c) {
   $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
   const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
   const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
+  // The shared tier above the parked ones (docs/LMCACHE.md): a store on its own port, shared with every other instance
+  // of this model. The pool's totals are this model's only when it is alone in it, so a shared pool says so instead.
+  const lmc = c.lmcache;
+  const pool = lmc && lmc.store ? lmc.store : {};
+  const mine = lmc && lmc.mine ? lmc.mine : {};
+  const lmcText = !lmc || !lmc.configured ? null
+    : !lmc.available ? "Not reachable"
+      : !mine.registered ? "This model is not registered"
+        : mine.exclusive ? `${fmt(mine.objects)} objects · ${gb(mine.bytes)} GB`
+          : `Pool shared with ${fmt(lmc.model_count)} model(s) · ${gb(pool.used_bytes)} GB`;
   facts($("cc-facts"), [
     ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
     ["Last switch", c.enabled ? event : null],
+    ["Shared cache (LMCache)", lmcText],
   ]);
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
