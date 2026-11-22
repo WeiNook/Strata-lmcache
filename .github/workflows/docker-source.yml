@@ -10,6 +10,12 @@ name: Docker image (from source)
 #
 # The first run with "push" off builds everything and publishes nothing (a dry run).  The engine compile is the long
 # pole and is cached by BuildKit (gha cache), so a second run of the same tree reuses it.
+#
+# If a push fails with "denied: permission_denied: write_package", GITHUB_TOKEN is authenticated but has no write
+# access to the package (typically the package was first published by hand, with a PAT, and is therefore not linked
+# to this repository).  Fix it one of two ways: give this repository write access under the package's
+# "Manage Actions access" settings, or create a classic PAT with write:packages and store it as the repository
+# secret GHCR_TOKEN.  The login step below prefers GHCR_TOKEN and falls back to GITHUB_TOKEN.
 
 on:
   workflow_dispatch:
@@ -68,12 +74,14 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
+        # A classic PAT in GHCR_TOKEN is preferred: a repository-scoped GITHUB_TOKEN is denied "write_package"
+        # when the package was first published by hand and never linked to this repository.
         if: inputs.push
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Build (and push)
         uses: docker/build-push-action@v6
