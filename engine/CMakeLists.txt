@@ -237,6 +237,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
                  src/core/lmcache_store.cpp src/core/lmcache_wire.cpp src/core/conversation_file.cpp)
   target_include_directories(lmcache_tier_test PRIVATE include)
   add_test(NAME lmcache_tier_test COMMAND lmcache_tier_test)
+
+  # a parked conversation cut into token windows and put back together: the bytes of token t at the offset they came
+  # from, which is what makes publishing only the new windows possible
+  add_executable(lmcache_chunk_test src/core/lmcache_chunk_test.cpp src/core/lmcache_chunk.cpp)
+  target_include_directories(lmcache_chunk_test PRIVATE include)
+  add_test(NAME lmcache_chunk_test COMMAND lmcache_chunk_test)
 endif()
 
 if(STRATA_HIP_GFX906)
