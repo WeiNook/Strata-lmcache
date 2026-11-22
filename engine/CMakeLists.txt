@@ -234,7 +234,8 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME lmcache_wire_test COMMAND lmcache_wire_test)
   # the shared cache tier's settings and INFO line: the STRATA_LMCACHE* contract, including what is ignored
   add_executable(lmcache_tier_test src/core/lmcache_tier_test.cpp src/core/lmcache_tier.cpp
-                 src/core/lmcache_store.cpp src/core/lmcache_wire.cpp src/core/conversation_file.cpp)
+                 src/core/lmcache_chunk.cpp src/core/lmcache_store.cpp src/core/lmcache_wire.cpp
+                 src/core/conversation_file.cpp)
   target_include_directories(lmcache_tier_test PRIVATE include)
   add_test(NAME lmcache_tier_test COMMAND lmcache_tier_test)
 

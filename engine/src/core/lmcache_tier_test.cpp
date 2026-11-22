@@ -171,22 +171,24 @@ public:
     int64_t chunk_tokens() const override { return 256; }
 
     bool put_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, const void* data, size_t bytes,
-                    std::string& why) override {
+                    std::string& why, const char* salt) override {
         ++puts;
         if (fail_put) { why = "the store refused the object"; return false; }
-        if (bytes != object_bytes()) { why = "wrong object size"; return false; }
-        if (end - start != chunk_tokens()) { why = "wrong chunk range"; return false; }
+        if (bytes > object_bytes()) { why = "a record is larger than its object"; return false; }
+        const std::string kind(salt ? salt : "");
+        if (kind.empty() && end - start != chunk_tokens()) { why = "wrong chunk range"; return false; }
         if (end > int64_t(tokens.size())) { why = "object past the prefix"; return false; }
-        objects[{start, end}].assign(static_cast<const char*>(data), bytes);
-        if (end > max_end) max_end = end;
+        objects[{kind, start}].assign(static_cast<const char*>(data), bytes);
+        if (kind.empty() && end > max_end) max_end = end;
         return true;
     }
 
     bool get_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, std::string& out, bool& present,
-                    std::string& why) override {
+                    std::string& why, const char* salt) override {
         ++gets;
         if (fail_get) { why = "the store is unreachable"; return false; }
-        const auto it = objects.find({start, end});
+        const std::string kind(salt ? salt : "");
+        const auto it = objects.find({kind, start});
         if (it == objects.end()) { present = false; return true; }
         if (end > int64_t(tokens.size())) { why = "the prefix is shorter than the stored session"; return false; }
         present = true;
@@ -198,7 +200,7 @@ public:
     bool fail_open = false, fail_put = false, fail_get = false;
     int puts = 0, gets = 0;
     int64_t max_end = 0;
-    std::map<std::pair<int64_t, int64_t>, std::string> objects;
+    std::map<std::pair<std::string, int64_t>, std::string> objects;   // (kind, start): "" = a K/V window
 
 private:
     int64_t per_token_;
@@ -234,26 +236,35 @@ struct Session {
     std::vector<int32_t> tokens;
 };
 
-Session make_session(size_t tokens, size_t kv_bytes_per_part = 3000) {
+//: A state whose K/V can be cut at 256 tokens: 4-cell pages, one indexer row per 4 cells, and each buffer a whole
+//: number of bytes per token (32 + 32 + 4 + 4, plus the pooled row's 128) - 200 bytes a token, which is what
+//: test_settings() registers and what FakeStore shapes its objects to.
+constexpr int64_t kPerToken = 400;   // both layers: 2 x (32 + 32 + 4 + 4) plus the two pooled row streams (2 x 128)
+constexpr int64_t kCells = 1024;
+
+Session make_session(size_t tokens, size_t = 0) {
     Session s;
     s.image.geometry = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17};
     s.image.layer_lo = 0;
     s.image.layer_hi = 48;
     s.image.cvec = false;
-    s.image.live = checkpoint(32, 1);
+    s.image.live = checkpoint(int(tokens), 1);   // the engine passes img.live.ids as the conversation's tokens
     s.image.checkpoints.push_back(checkpoint(8, 2));
     for (size_t i = 0; i < tokens; ++i) s.tokens.push_back(int32_t((i * 2654435761u) & 0x7fffffffu));
 
+    const int64_t cells = ((int64_t(tokens) + 255) / 256) * 256;   // whole chunks
     s.parts.resize(2);
     for (size_t layer = 0; layer < s.parts.size(); ++layer) {
-        for (size_t p = 0; p < 5; ++p) s.parts[layer][p] = bytes_of(kv_bytes_per_part + layer + p, uint8_t(layer * 5 + p));
+        const std::array<size_t, 5> sizes = {size_t(cells) * 32, size_t(cells) * 32, size_t(cells) * 4,
+                                             size_t(cells) * 4, size_t(cells / 4 + 1) * 128 * sizeof(float)};
+        for (size_t p = 0; p < 5; ++p) s.parts[layer][p] = bytes_of(sizes[p], uint8_t(layer * 5 + p));
         SessionKvSource src;
         src.format = 2 + int(layer);
-        src.cells = 1024;
+        src.cells = cells;
         src.heads = 2;
         src.head_dim = 256;
-        src.page_size = 64;
-        src.pooled_rows = 9;
+        src.page_size = 4;
+        src.pooled_rows = cells / 4 + 1;
         src.idx_dim = 128;
         for (size_t p = 0; p < 5; ++p) src.sizes[p] = s.parts[layer][p].size();
         src.read = [&s, layer](size_t part, size_t off, void* dst, size_t n) {
@@ -294,20 +305,27 @@ LmcacheSettings test_settings() {
     s.enabled = true;
     s.rpc = "fake://store";
     s.model = "test-model";
-    s.bytes_per_token = 64;   // a 16 KB object and a 256-token chunk: small enough to test fast, same shape as production
+    s.bytes_per_token = kPerToken;   // a 67 KB object and a 256-token chunk: small enough to test fast, same shape as production
     s.min_tokens = 512;
     return s;
 }
 
 // ---- the round trip --------------------------------------------------------------------------------------------
 
+bool publish_ok(LmcacheTier& tier, const Session& s, const SessionFileIdentity& id, const char* what,
+                std::string& why) {
+    const bool ok = tier.publish(s.image, s.kv, s.tokens, id, why);
+    if (!ok) std::fprintf(stderr, "  publish refused (%s): %s\n", what, why.c_str());
+    return ok;
+}
+
 void publish_restore_roundtrip() {
     Session s = make_session(1024);
-    LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(64));
+    LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(kPerToken + 64));
     const SessionFileIdentity id{0x1111222233334444ull, 0x5555666677778888ull};
 
     std::string why;
-    check(tier.publish(s.image, s.kv, s.tokens, id, why), "publish succeeds");
+    check(publish_ok(tier, s, id, "round trip", why), "publish succeeds");
     check(tier.stats().published == 1, "one publish counted");
     check(tier.stats().published_bytes > 0, "the published bytes are counted");
 
@@ -326,48 +344,39 @@ void publish_restore_roundtrip() {
     check(tier.stats().hits == 1 && tier.stats().restored == 1, "the hit is counted");
 }
 
-// The objects must carry the stream verbatim: the file layer and the store have to agree, or a conversation restored
-// from the store would differ from the same one restored from disk.
-void objects_carry_the_file_bytes() {
-    Session s = make_session(1024);
-    auto store = std::make_unique<FakeStore>(64);
+// A conversation only grows, so the windows an earlier publish wrote are still in the store: sending them again would
+// move the whole state on every turn.  This is the whole point of cutting it up.
+void only_new_windows_are_sent() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
     FakeStore* raw = store.get();
     LmcacheTier tier(test_settings(), std::move(store));
     const SessionFileIdentity id{0x0f0f0f0f0f0f0f0full, 0x0101010101010101ull};
-
     std::string why;
-    check(tier.publish(s.image, s.kv, s.tokens, id, why), "publish for the byte comparison");
 
-    const fs::path dir = fs::temp_directory_path() / ("strata-lmcache-test-" + std::to_string(checks));
-    fs::create_directories(dir);
-    const fs::path file = dir / "s.bin";
-    size_t bytes = 0;
-    check(session_file_write(file.string(), s.image, s.kv, id, bytes, why), "the file layer wrote the same session");
+    Session first = make_session(1024);
+    check(publish_ok(tier, first, id, "first", why), "the first publish sends the whole state");
+    check(raw->puts == 1 + 4, "one record plus four windows of 256 tokens");
 
-    std::string all;
-    for (const auto& kv : raw->objects) all += kv.second;
+    Session grown = make_session(1280);   // the same conversation, two turns later
+    const int before = raw->puts;
+    check(publish_ok(tier, grown, id, "grown", why), "the grown conversation publishes");
+    check(raw->puts - before == 1 + 1, "only the record and the new window are sent, not the five already there");
 
-    std::vector<char> from_file;
-    if (std::FILE* f = std::fopen(file.string().c_str(), "rb")) {
-        std::fseek(f, 0, SEEK_END);
-        const long n = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        if (n > 0) {
-            from_file.resize(size_t(n));
-            if (std::fread(from_file.data(), 1, size_t(n), f) != size_t(n)) from_file.clear();
-        }
-        std::fclose(f);
-    }
-    check(from_file.size() == bytes, "the file is the size the writer reported");
-    check(all.size() >= from_file.size() && !from_file.empty() &&
-              std::memcmp(all.data(), from_file.data(), from_file.size()) == 0,
-          "the objects ARE the file's bytes, then padding");
-    fs::remove_all(dir);
+    SavedConversation back;
+    check(tier.restore(grown.tokens, id, back, {}, why), "the grown conversation restores");
+    check(int64_t(back.live.ids.size()) == 1280, "the state comes back with all of its tokens");
+    check(back.kv.size() == grown.kv.size() && buffer_equals(back.kv[0].k, grown.parts[0][0]),
+          "the K/V of the grown conversation came back");
+
+    // and publishing the same conversation again (nothing new) sends the record alone
+    const int steady = raw->puts;
+    check(tier.publish(grown.image, grown.kv, grown.tokens, id, why), "an unchanged conversation publishes");
+    check(raw->puts - steady == 1, "with nothing new, only the record is rewritten");
 }
 
 void cost_gate_refuses_short_prefixes() {
     Session s = make_session(300);   // below the 512-token gate
-    auto store = std::make_unique<FakeStore>(64);
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
     FakeStore* raw = store.get();
     LmcacheTier tier(test_settings(), std::move(store));
     const SessionFileIdentity id{1, 2};
@@ -380,25 +389,34 @@ void cost_gate_refuses_short_prefixes() {
 
 void prefix_is_cut_at_chunk_boundaries() {
     Session s = make_session(1000);   // 3 whole chunks of 256, 232 tokens left over
-    auto store = std::make_unique<FakeStore>(64);
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
     FakeStore* raw = store.get();
     LmcacheTier tier(test_settings(), std::move(store));
     const SessionFileIdentity id{3, 4};
     std::string why;
-    check(tier.publish(s.image, s.kv, s.tokens, id, why), "a 1000-token session publishes");
+    check(publish_ok(tier, s, id, "1000 tokens", why), "a 1000-token session publishes");
     check(raw->max_end == 768, "the stored prefix floors to 768 tokens, never past the last whole chunk");
-    check(raw->objects.size() == 3, "three objects of 256 tokens");
-    for (const auto& kv : raw->objects)
-        check(kv.first.second - kv.first.first == 256, "each object is exactly one chunk");
+    int64_t windows = 0;
+    for (const auto& kv : raw->objects) windows += kv.first.first.empty() ? 1 : 0;
+    check(windows == 3, "three windows of 256 tokens");
+    check(raw->objects.size() == 4, "the record and three windows reached the store");
 
     SavedConversation back;
     check(tier.restore(s.tokens, id, back, {}, why), "and it restores");
-    check(same_state(s.image, back), "the state survived the chunk boundary");
+    // A window is a whole chunk, so the state comes back as the 768-token prefix it stored - not the 232 tokens that
+    // never filled one.  The engine reads those again, which is what the chunk floor has always meant.
+    check(back.live.ids.size() == 768, "the restored state covers the whole chunks that were stored");
+    check(std::equal(back.live.ids.begin(), back.live.ids.end(), s.image.live.ids.begin()),
+          "its tokens are the conversation's own prefix");
+    std::vector<uint8_t> k_head(768 * 32);
+    check(back.kv[0].k.read(k_head.data(), 0, k_head.size()), "the restored K is readable");
+    check(std::memcmp(k_head.data(), s.parts[0][0].data(), k_head.size()) == 0,
+          "the restored K is the prefix the store was given");
 }
 
 void a_store_failure_is_never_fatal() {
     Session s = make_session(1024);
-    auto store = std::make_unique<FakeStore>(64);
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
     FakeStore* raw = store.get();
     LmcacheTier tier(test_settings(), std::move(store));
     const SessionFileIdentity id{5, 6};
@@ -424,7 +442,7 @@ void a_store_failure_is_never_fatal() {
 
 void a_miss_is_not_an_error() {
     Session s = make_session(1024);
-    LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(64));
+    LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(kPerToken + 64));
     const SessionFileIdentity id{7, 8};
     SavedConversation out;
     std::string why;
@@ -435,7 +453,7 @@ void a_miss_is_not_an_error() {
 
 void another_identity_is_refused() {
     Session s = make_session(1024);
-    LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(64));
+    LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(kPerToken + 64));
     const SessionFileIdentity id{9, 10};
     std::string why;
     check(tier.publish(s.image, s.kv, s.tokens, id, why), "publish under one identity");
@@ -449,7 +467,7 @@ void another_identity_is_refused() {
 
 void disabled_tier_does_nothing() {
     LmcacheSettings off;   // enabled = false
-    LmcacheTier tier(off, std::make_unique<FakeStore>(64));
+    LmcacheTier tier(off, std::make_unique<FakeStore>(kPerToken + 64));
     Session s = make_session(4096);
     const SessionFileIdentity id{11, 12};
     std::string why;
@@ -465,7 +483,7 @@ int live(const std::string& endpoint) {
     LmcacheSettings s = test_settings();
     s.rpc = endpoint;
     s.model = "strata/tier-selftest";
-    s.bytes_per_token = 19531;   // the production shape: a 5 MB object
+    s.bytes_per_token = kPerToken;   // the fixture's shape, so one window is one object
     s.min_tokens = 256;
     LmcacheTier tier(s, lmcache_zmq_store(s.rpc, s.model, s.bytes_per_token, 9911));
 
@@ -499,7 +517,7 @@ int main(int argc, char** argv) {
     settings_surface();
     info_lines();
     publish_restore_roundtrip();
-    objects_carry_the_file_bytes();
+    only_new_windows_are_sent();
     cost_gate_refuses_short_prefixes();
     prefix_is_cut_at_chunk_boundaries();
     a_store_failure_is_never_fatal();

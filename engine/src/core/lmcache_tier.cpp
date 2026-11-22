@@ -1,5 +1,7 @@
 #include "strata/core/lmcache_tier.hpp"
 
+#include "strata/core/lmcache_chunk.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -88,190 +90,102 @@ std::string lmcache_info_line(const LmcacheSettings& s, const LmcacheStats& st) 
 
 // ---- the tier: one conversation <-> a chain of chunk objects ----------------------------------------------------
 namespace {
-// Serializes into the store: the same 16 MiB-blocked walk the file layer uses, cut again at the store's object size,
-// so a 1.2 GB state is handed over object by object and never held twice.
-class StoreSink : public SessionSink {
+
+// One record = one image serialized in the session format.  A published conversation is a handful of them: a META
+// record (its tokens, checkpoints and running state) and one record per 256-token window of K/V.  Each record is the
+// same format a session file has, so the hash, the identity and the limits all come for free; what changes is the
+// composition, and that is what makes a growing conversation cheap: its first windows are already in the store.
+class RamSink : public SessionSink {
 public:
-    StoreSink(LmcacheStore& store, const std::vector<int32_t>& tokens, std::string& why)
-        : store_(store), tokens_(tokens), why_(why) {}
-
-    bool ok() const override { return ok_; }
-    std::string error() const override { return why_; }
-    SessionError kind() const override { return SessionError::io; }
-
+    bool ok() const override { return true; }
+    std::string error() const override { return std::string(); }
+    SessionError kind() const override { return SessionError::none; }
     bool begin(uint64_t total) override {
-        total_ = total;
-        object_ = store_.object_bytes();
-        chunk_ = store_.chunk_tokens();
-        if (object_ == 0 || chunk_ <= 0) {
-            ok_ = false;
-            why_ = "the store reports no object shape";
-            return false;
-        }
-        // only whole chunks of the prefix can be addressed, and the state has to fit in them
-        const int64_t usable_tokens = (int64_t(tokens_.size()) / chunk_) * chunk_;
-        const int64_t available = usable_tokens / chunk_;
-        objects_ = int64_t((total + object_ - 1) / object_);
-        if (available <= 0) {
-            ok_ = false;
-            why_ = "the conversation is shorter than one chunk (" + std::to_string(tokens_.size()) + " tokens)";
-            return false;
-        }
-        if (objects_ > available) {
-            ok_ = false;
-            why_ = "the state needs " + std::to_string(objects_) + " objects but the prefix holds " +
-                   std::to_string(available) + " (raise STRATA_LMCACHE_BYTES_PER_TOKEN?)";
-            return false;
-        }
-        buf_.assign(object_, 0);
+        buf_.clear();
+        buf_.reserve(size_t(total));
         return true;
     }
-
     uint8_t* span(size_t& room) override {
-        room = object_ - used_;   // one whole object at a time: commit() can hand it over without a copy
-        return buf_.data() + used_;
+        room = kSessionBlock;
+        const size_t at = buf_.size();
+        buf_.resize(at + room);
+        return reinterpret_cast<uint8_t*>(&buf_[at]);
     }
-
     bool commit(size_t n) override {
-        used_ += n;
-        if (used_ < object_) return true;
-        return flush();
+        buf_.resize(buf_.size() - (kSessionBlock - n));
+        return true;
     }
-
     bool write(const void* p, size_t n) override {
-        const uint8_t* s = static_cast<const uint8_t*>(p);
-        while (n) {
-            size_t room = 0;
-            uint8_t* d = span(room);
-            const size_t c = n < room ? n : room;
-            std::memcpy(d, s, c);
-            if (!commit(c)) return false;
-            s += c;
-            n -= c;
-        }
+        buf_.append(static_cast<const char*>(p), n);
         return true;
     }
-
-    bool finish(bool) override {
-        if (!ok_) return false;
-        if (used_ > 0 || index_ == 0) return flush();   // the padded tail, or a state smaller than one object
-        return true;
-    }
-
-    int64_t objects() const { return index_; }
+    bool finish(bool) override { return true; }
+    const std::string& bytes() const { return buf_; }
 
 private:
-    bool flush() {
-        const int64_t start = index_ * chunk_;
-        const int64_t end = start + chunk_;
-        if (end > int64_t(tokens_.size())) {
-            ok_ = false;
-            why_ = "the prefix ended before the state did";
-            return false;
-        }
-        if (used_ < object_) std::memset(buf_.data() + used_, 0, object_ - used_);   // the tail is padding, not data
-        if (!store_.put_object(tokens_, start, end, buf_.data(), object_, why_)) {
-            ok_ = false;
-            return false;
-        }
-        ++index_;
-        used_ = 0;
-        return true;
-    }
-
-    LmcacheStore& store_;
-    const std::vector<int32_t>& tokens_;
-    std::string& why_;
-    std::vector<uint8_t> buf_;
-    size_t object_ = 0, used_ = 0;
-    int64_t chunk_ = 0, objects_ = 0;
-    uint64_t total_ = 0;
-    int64_t index_ = 0;
-    bool ok_ = true;   // "nothing has gone wrong yet": begin() is what decides whether this sink can work
+    std::string buf_;
 };
 
-// Reads the chain back, one object at a time.  The first object carries the stream's header, which says how long the
-// stream is - that is what lets this answer begin() without a separate manifest.
-class StoreSource : public SessionSource {
+class RamSource : public SessionSource {
 public:
-    StoreSource(LmcacheStore& store, const std::vector<int32_t>& tokens, std::string& why)
-        : store_(store), tokens_(tokens), why_(why) {}
-
-    bool ok() const override { return ok_; }
-    std::string error() const override { return why_; }
-    SessionError kind() const override { return SessionError::io; }
-    bool missed() const { return missed_; }
-
+    explicit RamSource(std::string bytes) : bytes_(std::move(bytes)) {
+        // An object is padded to the shape the store was registered with, so the bytes are longer than the record.
+        // The record's own header says how long it is (the payload length sits at offset 32 of the header).
+        if (bytes_.size() >= kSessionHeaderBytes) {
+            uint64_t payload = 0;
+            for (int i = 7; i >= 0; --i) payload = (payload << 8) | uint8_t(bytes_[32 + i]);
+            const uint64_t total = kSessionHeaderBytes + payload + kSessionTrailerBytes;
+            if (total <= bytes_.size()) bytes_.resize(size_t(total));
+        }
+    }
+    bool ok() const override { return true; }
+    std::string error() const override { return std::string(); }
+    SessionError kind() const override { return SessionError::none; }
     bool begin(uint64_t& total) override {
-        object_ = store_.object_bytes();
-        chunk_ = store_.chunk_tokens();
-        if (object_ == 0 || chunk_ <= 0) {
-            why_ = "the store reports no object shape";
-            return false;
-        }
-        if (!fetch(0)) return false;
-        if (cur_.size() < kSessionHeaderBytes) {
-            why_ = "the first object is shorter than a session header";
-            return false;
-        }
-        // header v1, little-endian: payload length at offset 32
-        uint64_t payload = 0;
-        for (int i = 7; i >= 0; --i) payload = payload << 8 | uint8_t(cur_[32 + i]);
-        total_ = kSessionHeaderBytes + payload + kSessionTrailerBytes;
-        objects_ = int64_t((total_ + object_ - 1) / object_);
-        available_ = cur_.size();
-        at_ = 0;
-        served_ = 0;
-        total = total_;
+        total = bytes_.size();
         return true;
     }
-
     bool read(void* p, size_t n) override {
-        uint8_t* d = static_cast<uint8_t*>(p);
-        while (n) {
-            if (at_ == available_) {
-                if (!fetch(++index_)) return false;
-                available_ = cur_.size();
-                at_ = 0;
-            }
-            const size_t c = std::min(n, available_ - at_);
-            std::memcpy(d, cur_.data() + at_, c);
-            at_ += c;
-            d += c;
-            n -= c;
-            served_ += c;
-        }
+        if (at_ + n > bytes_.size()) return false;
+        std::memcpy(p, bytes_.data() + at_, n);
+        at_ += n;
         return true;
     }
 
 private:
-    bool fetch(int64_t index) {
-        const int64_t start = index * chunk_;
-        const int64_t end = start + chunk_;
-        if (end > int64_t(tokens_.size())) {
-            why_ = "the prefix is shorter than the stored session";
-            return false;
-        }
-        bool present = false;
-        if (!store_.get_object(tokens_, start, end, cur_, present, why_)) return false;
-        if (!present) {
-            missed_ = index == 0;   // nothing there at all; a later gap is a store that lost an object
-            why_ = index == 0 ? "no session for this prefix" : "the store is missing object " + std::to_string(index);
-            return false;
-        }
-        return true;
-    }
-
-    LmcacheStore& store_;
-    const std::vector<int32_t>& tokens_;
-    std::string& why_;
-    std::string cur_;
-    size_t object_ = 0, available_ = 0, at_ = 0;
-    int64_t chunk_ = 0, objects_ = 0, index_ = 0;
-    uint64_t total_ = 0, served_ = 0;
-    bool ok_ = true, missed_ = false;
+    std::string bytes_;
+    size_t at_ = 0;
 };
+
+// Serializes one record and hands it to the store; `salt` says which kind it is ("" = a K/V window).
+bool put_record(LmcacheStore& store, const SavedConversation& image, const std::vector<SessionKvSource>* kv,
+                const std::vector<int32_t>& tokens, int64_t start, int64_t end, const char* salt,
+                const SessionFileIdentity& id, std::string& why) {
+    RamSink sink;
+    SessionStatus st;
+    size_t bytes = 0;
+    const bool wrote = kv ? session_stream_write(sink, image, *kv, id, bytes, why, &st)
+                          : session_stream_write(sink, image, id, bytes, why, &st);
+    if (!wrote) return false;
+    return store.put_object(tokens, start, end, sink.bytes().data(), sink.bytes().size(), why, salt);
+}
+
+// Reads one record back, or reports a miss.
+bool get_record(LmcacheStore& store, const std::vector<int32_t>& tokens, int64_t start, int64_t end, const char* salt,
+                const SessionFileIdentity& id, const SessionReadLimits& limits, SavedConversation& out, bool& present,
+                std::string& why) {
+    std::string bytes;
+    if (!store.get_object(tokens, start, end, bytes, present, why, salt)) return false;
+    if (!present) return true;
+    RamSource source(std::move(bytes));
+    size_t read = 0;
+    SessionStatus st;
+    if (!session_stream_read(source, id, out, read, why, limits, &st)) return false;
+    return true;
+}
+
 }  // namespace
+
 
 LmcacheTier::LmcacheTier(LmcacheSettings settings, std::unique_ptr<LmcacheStore> store)
     : settings_(std::move(settings)), store_(std::move(store)) {
@@ -309,22 +223,83 @@ bool LmcacheTier::publish_impl(const SavedConversation& image, const std::vector
         stats_.connected = false;
         return false;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    StoreSink sink(*store_, tokens, why);
-    SessionStatus st;
-    size_t bytes = 0;
-    const bool wrote = kv ? session_stream_write(sink, image, *kv, id, bytes, why, &st)
-                          : session_stream_write(sink, image, id, bytes, why, &st);
-    if (!wrote) {
+    const int64_t chunk = store_->chunk_tokens();
+    const bool shaped = kv ? chunk_size_ok_from(*kv, chunk, tokens, why) : chunk_size_ok(image, chunk, tokens, why);
+    if (!shaped) {
         ++stats_.failed;
         stats_.connected = false;
         return false;
     }
-    ++stats_.published;
-    stats_.published_bytes += int64_t(bytes);
+    const int64_t total = chunk_windows(tokens, chunk);
+    const auto t0 = std::chrono::steady_clock::now();
+    // 1. the record that makes the windows add up to a conversation: its tokens, checkpoints and running state.  It is
+    //    rewritten on every publish (it is small) and it is what a reader looks for first.
+    {
+        SavedConversation meta = image;
+        for (ConversationKv& k : meta.kv) {
+            k.k = ConversationBuffer{};
+            k.v = ConversationBuffer{};
+            k.k_scale = ConversationBuffer{};
+            k.v_scale = ConversationBuffer{};
+            k.pooled = ConversationBuffer{};
+            k.cells = 0;
+            k.pooled_rows = 0;
+        }
+        if (!put_record(*store_, meta, nullptr, tokens, 0, chunk, "meta", id, why)) {
+            ++stats_.failed;
+            stats_.connected = false;
+            return false;
+        }
+    }
+    // 2. the windows the store does not hold yet.  Since a conversation only grows, the ones written by an earlier
+    //    publish are still there: writing them again would send the whole state on every turn.
+    const int64_t already = published_windows(tokens, chunk);
+    int64_t written = 0;
+    for (int64_t i = already; i < total; ++i) {
+        ChunkWindow window{i * chunk, chunk};
+        SavedConversation piece;
+        const bool cut = kv ? chunk_extract_from(image, *kv, window, piece, why)
+                            : chunk_extract(image, window, piece, why);
+        if (!cut) {
+            ++stats_.failed;
+            stats_.connected = false;
+            return false;
+        }
+        if (!put_record(*store_, piece, nullptr, tokens, window.first, window.first + chunk, "", id, why)) {
+            ++stats_.failed;
+            stats_.connected = false;
+            return false;
+        }
+        ++written;
+    }
+    remember_published(tokens, total, chunk);
+    if (written > 0) {
+        ++stats_.published;
+        stats_.published_bytes += int64_t(written) * int64_t(store_->object_bytes());
+    }
     stats_.connected = true;
     stats_.last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     return true;
+}
+
+int64_t LmcacheTier::published_windows(const std::vector<int32_t>& tokens, int64_t chunk) const {
+    for (auto it = published_.rbegin(); it != published_.rend(); ++it) {
+        if (it->ids.size() <= tokens.size() && std::equal(it->ids.begin(), it->ids.end(), tokens.begin()))
+            return std::min(it->windows, int64_t(tokens.size()) / chunk);
+    }
+    return 0;
+}
+
+void LmcacheTier::remember_published(const std::vector<int32_t>& tokens, int64_t windows, int64_t chunk) {
+    const size_t held = std::min(tokens.size(), size_t(std::max<int64_t>(windows, 0) * chunk));
+    for (auto it = published_.begin(); it != published_.end(); ++it) {
+        if (it->ids.size() == held && std::equal(it->ids.begin(), it->ids.end(), tokens.begin())) {
+            it->windows = std::max(it->windows, windows);
+            return;
+        }
+    }
+    published_.push_back(Published{std::vector<int32_t>(tokens.begin(), tokens.begin() + held), windows});
+    while (published_.size() > 2) published_.erase(published_.begin());   // the two conversations in flight, at most
 }
 
 bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, SavedConversation& out,
@@ -335,35 +310,69 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
         return false;
     }
     ++stats_.probes;
-    // the same cost gate as publishing: a short prefix is not worth an object fetch (which is a miss anyway)
-    if (int64_t(tokens.size()) < settings_.min_tokens) {
-        why = "prefix of " + std::to_string(tokens.size()) + " tokens is below the cost gate (" +
-              std::to_string(settings_.min_tokens) + ")";
-        return false;
-    }
     if (!store_->open(why)) {
         ++stats_.failed;
         stats_.connected = false;
         return false;
     }
+    const int64_t chunk = store_->chunk_tokens();
     const auto t0 = std::chrono::steady_clock::now();
-    StoreSource source(*store_, tokens, why);
-    SessionStatus st;
-    size_t bytes = 0;
-    // the read validates the header hash, the identity, every object's length, the payload hash and the end marker:
-    // a session that was written by another model or configuration is refused here, before `out` is touched
-    if (!session_stream_read(source, id, out, bytes, why, limits, &st)) {
-        if (source.missed()) {
-            stats_.connected = true;   // the store answered: it simply does not have this prefix
-            return false;
-        }
+    // 1. the conversation's own record.  Without it the windows are just bytes: it holds the tokens, the checkpoints
+    //    and the running state they belong to.
+    SavedConversation meta;
+    bool present = false;
+    if (!get_record(*store_, tokens, 0, chunk, "meta", id, limits, meta, present, why)) {
         ++stats_.failed;
         stats_.connected = false;
         return false;
     }
+    if (!present) {
+        stats_.connected = true;   // the store answered: it simply does not have this prefix
+        why = "no session for this prefix";
+        return false;
+    }
+    const int64_t total = int64_t(meta.live.ids.size()) / chunk;
+    if (total <= 0) {
+        stats_.connected = true;
+        why = "the store's record holds no whole chunk";
+        return false;
+    }
+    // 2. every window.  The record's running state belongs to the whole conversation, so a chain that lost one window
+    //    is not a shorter session - it is an unusable one (a partial chain is refused, exactly as before the split).
+    SavedConversation image;
+    for (int64_t i = 0; i < total; ++i) {
+        SavedConversation piece;
+        if (!get_record(*store_, tokens, i * chunk, (i + 1) * chunk, "", id, limits, piece, present, why)) {
+            ++stats_.failed;
+            stats_.connected = false;
+            return false;
+        }
+        if (!present) {
+            stats_.connected = true;
+            why = "the store is missing window " + std::to_string(i) + " of " + std::to_string(total);
+            return false;
+        }
+        if (i == 0) {
+            if (!chunk_reserve(image, piece, total * chunk, why)) {
+                ++stats_.failed;
+                stats_.connected = false;
+                return false;
+            }
+            image.live = meta.live;
+            image.live.ids.resize(size_t(total * chunk));
+            image.checkpoints = meta.checkpoints;
+        }
+        if (!chunk_merge(image, piece, ChunkWindow{i * chunk, chunk}, why)) {
+            ++stats_.failed;
+            stats_.connected = false;
+            return false;
+        }
+    }
+    out = std::move(image);
+    remember_published(tokens, total, chunk);   // what is in the store is now known to be there
     ++stats_.hits;
     stats_.restored += 1;
-    stats_.restored_bytes += int64_t(bytes);
+    stats_.restored_bytes += int64_t(out.bytes());
     stats_.connected = true;
     stats_.last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     return true;

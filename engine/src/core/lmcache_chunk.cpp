@@ -41,33 +41,43 @@ bool copy_range(ConversationBuffer& dst, size_t dst_at, const ConversationBuffer
     });
 }
 
-bool shape_of(const ConversationKv& k, Shape& s, std::string& why) {
-    if (k.cells <= 0) { why = "a layer holds no tokens"; return false; }
-    if (k.page_size <= 0) { why = "a layer reports no page size"; return false; }
-    if (k.idx_dim <= 0) { why = "a layer reports no indexer width"; return false; }
-    const std::array<const ConversationBuffer*, kBuffers> buf = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+bool shape_of_sizes(int64_t cells, int64_t page_size, int64_t idx_dim, const std::array<size_t, kBuffers>& bytes_of,
+                    Shape& s, std::string& why) {
+    if (cells <= 0) { why = "a layer holds no tokens"; return false; }
+    if (page_size <= 0) { why = "a layer reports no page size"; return false; }
+    if (idx_dim <= 0) { why = "a layer reports no indexer width"; return false; }
+    s.cells = cells;
+    s.page = page_size;
     bool any = false;
     for (size_t i = 0; i < kTokenMajor; ++i) {
-        const size_t bytes = buf[i]->size();
-        if (bytes % size_t(k.cells)) { why = "a K/V buffer is not a whole number of bytes per token"; return false; }
-        s.per[i] = bytes / size_t(k.cells);
+        const size_t bytes = bytes_of[i];
+        if (bytes % size_t(cells)) { why = "a K/V buffer is not a whole number of bytes per token"; return false; }
+        s.per[i] = bytes / size_t(cells);
         any = any || s.per[i] != 0;
     }
     if (!any) { why = "a layer holds no K/V bytes"; return false; }
-    s.row = size_t(k.idx_dim) * sizeof(float);
-    if (k.pooled.size() % s.row) { why = "the pooled buffer is not a whole number of rows"; return false; }
-    s.rows = int64_t(k.pooled.size() / s.row);
+    s.row = size_t(idx_dim) * sizeof(float);
+    if (bytes_of[4] % s.row) { why = "the pooled buffer is not a whole number of rows"; return false; }
+    s.rows = int64_t(bytes_of[4] / s.row);
     if (s.rows < 2) { why = "the pooled buffer holds no complete block"; return false; }
     // `pooled_rows = upto / idx_block + 1`, so the block is what the spare row leaves over.  Anything that does not come
     // out whole means this image's layout is not the one this code knows: refuse rather than cut it in the wrong place.
-    s.block = k.cells / (s.rows - 1);
-    if (s.block <= 0 || s.block * (s.rows - 1) > k.cells || k.cells - s.block * (s.rows - 1) > s.block) {
+    s.block = cells / (s.rows - 1);
+    if (s.block <= 0 || s.block * (s.rows - 1) > cells || cells - s.block * (s.rows - 1) > s.block) {
         why = "the pooled rows do not divide the token count";
         return false;
     }
-    s.cells = k.cells;
-    s.page = k.page_size;
     return true;
+}
+
+bool shape_of(const ConversationKv& k, Shape& s, std::string& why) {
+    const std::array<size_t, kBuffers> bytes_of = {k.k.size(), k.v.size(), k.k_scale.size(), k.v_scale.size(),
+                                                   k.pooled.size()};
+    return shape_of_sizes(k.cells, k.page_size, k.idx_dim, bytes_of, s, why);
+}
+
+bool shape_of(const SessionKvSource& k, Shape& s, std::string& why) {
+    return shape_of_sizes(k.cells, k.page_size, k.idx_dim, k.sizes, s, why);
 }
 
 bool shapes_of(const SavedConversation& image, Shape& s, std::string& why) {
@@ -81,6 +91,40 @@ bool shapes_of(const SavedConversation& image, Shape& s, std::string& why) {
         if (!same_shape(first, other)) { why = "the K/V layers disagree on their shape"; return false; }
     }
     s = first;
+    return true;
+}
+
+bool shapes_of(const std::vector<SessionKvSource>& kv, Shape& s, std::string& why) {
+    if (kv.empty()) { why = "the state holds no K/V sources"; return false; }
+    Shape first;
+    if (!shape_of(kv.front(), first, why)) return false;
+    for (size_t i = 1; i < kv.size(); ++i) {
+        Shape other;
+        if (!shape_of(kv[i], other, why)) return false;
+        if (!same_shape(first, other)) { why = "the K/V sources disagree on their shape"; return false; }
+    }
+    s = first;
+    return true;
+}
+
+// The chunk-size rules, once: both forms of a state answer the same way.
+bool size_ok(const Shape& s, int64_t chunk, const std::vector<int32_t>& ids, std::string& why) {
+    const int64_t step = std::lcm(s.page, s.block);
+    if (chunk <= 0) { why = "the chunk size is not positive"; return false; }
+    if (chunk % step) {
+        why = "a chunk of " + std::to_string(chunk) + " tokens is not a multiple of this state's " +
+              std::to_string(step) + " token page/block";
+        return false;
+    }
+    if (int64_t(ids.size()) < chunk) {
+        why = "the prefix (" + std::to_string(ids.size()) + " tokens) is shorter than one chunk";
+        return false;
+    }
+    if (int64_t(ids.size()) > s.cells) {
+        why = "the prefix (" + std::to_string(ids.size()) + " tokens) is longer than the state (" +
+              std::to_string(s.cells) + " tokens)";
+        return false;
+    }
     return true;
 }
 
@@ -107,23 +151,14 @@ int64_t chunk_granularity(const SavedConversation& image) {
 bool chunk_size_ok(const SavedConversation& image, int64_t chunk, const std::vector<int32_t>& ids, std::string& why) {
     Shape s;
     if (!shapes_of(image, s, why)) return false;
-    const int64_t step = std::lcm(s.page, s.block);
-    if (chunk <= 0) { why = "the chunk size is not positive"; return false; }
-    if (chunk % step) {
-        why = "a chunk of " + std::to_string(chunk) + " tokens is not a multiple of this state's " +
-              std::to_string(step) + " token page/block";
-        return false;
-    }
-    if (int64_t(ids.size()) < chunk) {
-        why = "the prefix (" + std::to_string(ids.size()) + " tokens) is shorter than one chunk";
-        return false;
-    }
-    if (int64_t(ids.size()) > s.cells) {
-        why = "the prefix (" + std::to_string(ids.size()) + " tokens) is longer than the state (" +
-              std::to_string(s.cells) + " tokens)";
-        return false;
-    }
-    return true;
+    return size_ok(s, chunk, ids, why);
+}
+
+bool chunk_size_ok_from(const std::vector<SessionKvSource>& kv, int64_t chunk, const std::vector<int32_t>& ids,
+                        std::string& why) {
+    Shape s;
+    if (!shapes_of(kv, s, why)) return false;
+    return size_ok(s, chunk, ids, why);
 }
 
 int64_t chunk_windows(const std::vector<int32_t>& ids, int64_t chunk) {
@@ -175,6 +210,60 @@ bool chunk_extract(const SavedConversation& image, const ChunkWindow& window, Sa
         db[4]->resize(size_t(rows) * s.row);
         if (!copy_range(*db[4], 0, *sb[4], size_t(first_row) * s.row, size_t(rows) * s.row)) {
             why = "the pooled buffer could not be copied";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool chunk_extract_from(const SavedConversation& image, const std::vector<SessionKvSource>& kv, const ChunkWindow& window,
+                        SavedConversation& out, std::string& why) {
+    if (!image.stage_images.empty()) { why = "a layer-split state cannot be cut into chunks"; return false; }
+    Shape s;
+    if (!shapes_of(kv, s, why)) return false;
+    if (!window_ok(s, window, why)) return false;
+    if (int64_t(image.live.ids.size()) < window.first + window.tokens) {
+        why = "the window runs past the conversation's tokens";
+        return false;
+    }
+    out = SavedConversation{};
+    out.geometry = image.geometry;
+    out.layer_lo = image.layer_lo;
+    out.layer_hi = image.layer_hi;
+    out.cvec = image.cvec;
+    out.live.ids.assign(image.live.ids.begin() + window.first, image.live.ids.begin() + window.first + window.tokens);
+    out.kv.resize(kv.size());
+    const int64_t first_row = window.first / s.block;
+    const int64_t rows = window.tokens / s.block + 1;
+    for (size_t i = 0; i < kv.size(); ++i) {
+        const SessionKvSource& src = kv[i];
+        ConversationKv& dst = out.kv[i];
+        dst.format = src.format;
+        dst.cells = window.tokens;
+        dst.heads = src.heads;
+        dst.head_dim = src.head_dim;
+        dst.page_size = src.page_size;
+        dst.pooled_rows = rows;
+        dst.idx_dim = src.idx_dim;
+        const std::array<ConversationBuffer*, kBuffers> db = {&dst.k, &dst.v, &dst.k_scale, &dst.v_scale, &dst.pooled};
+        for (size_t j = 0; j < kTokenMajor; ++j) {
+            const size_t bytes = size_t(window.tokens) * s.per[j];
+            db[j]->resize(bytes);
+            const size_t from = size_t(window.first) * s.per[j];
+            if (!db[j]->visit(0, bytes, [&](uint8_t* q, size_t len, size_t at) {
+                    return src.read(j, from + at, q, len);
+                })) {
+                why = "a K/V source could not be read";
+                return false;
+            }
+        }
+        if (first_row + rows > s.rows) { why = "the pooled rows are shorter than the window"; return false; }
+        db[4]->resize(size_t(rows) * s.row);
+        const size_t from = size_t(first_row) * s.row;
+        if (!db[4]->visit(0, size_t(rows) * s.row, [&](uint8_t* q, size_t len, size_t at) {
+                return src.read(4, from + at, q, len);
+            })) {
+            why = "the pooled source could not be read";
             return false;
         }
     }

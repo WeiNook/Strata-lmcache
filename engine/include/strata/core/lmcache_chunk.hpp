@@ -15,6 +15,7 @@
 
 #include "strata/core/conversation_buffer.hpp"
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_file.hpp"   // SessionKvSource
 
 #include <cstdint>
 #include <string>
@@ -34,12 +35,21 @@ int64_t chunk_granularity(const SavedConversation& image);
 //: no wider than what the conversation holds.  `why` says which rule failed.
 bool chunk_size_ok(const SavedConversation& image, int64_t chunk, const std::vector<int32_t>& ids, std::string& why);
 
+//: The same check for a state whose K/V is still owned by its layers (`image.kv` is empty then).
+bool chunk_size_ok_from(const std::vector<SessionKvSource>& kv, int64_t chunk, const std::vector<int32_t>& ids,
+                        std::string& why);
+
 //: How many whole windows of `chunk` tokens `ids` holds (the tail that does not fill one is not published).
 int64_t chunk_windows(const std::vector<int32_t>& ids, int64_t chunk);
 
 //: The image of one window: same geometry, same layers, `ids` and every buffer cut to [first, first + tokens).
 //: Serializing it with `session_stream_write` gives one object that a store can hold - and lose - on its own.
 bool chunk_extract(const SavedConversation& image, const ChunkWindow& window, SavedConversation& out, std::string& why);
+
+//: The same, for a state whose K/V is still owned by its layers: only the window's byte ranges are read, so a window
+//: costs its own size and never the whole conversation.
+bool chunk_extract_from(const SavedConversation& image, const std::vector<SessionKvSource>& kv, const ChunkWindow& window,
+                        SavedConversation& out, std::string& why);
 
 //: An empty image shaped like `chunk` but `tokens` long, ready for `chunk_merge` (buffers allocated, ids sized).
 bool chunk_reserve(SavedConversation& out, const SavedConversation& chunk, int64_t tokens, std::string& why);

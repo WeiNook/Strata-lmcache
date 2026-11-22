@@ -30,14 +30,17 @@ public:
 
     // Object [start, end) of `tokens` (end - start == chunk size).  `data` is exactly the object's bytes.  A `false`
     // return means the store refused or is unreachable: the caller's request goes on without the cache.
+    // `salt` separates the kinds of object one prefix has ("" = the K/V window at that range, "meta" = the
+    // conversation's own record).  `bytes` may be smaller than `object_bytes()`: the store pads it.
     virtual bool put_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, const void* data,
-                            size_t bytes, std::string& why) = 0;
+                            size_t bytes, std::string& why, const char* salt = "") = 0;
     // Fetches an object into `out`.  `present` is false when the store simply does not have it (a miss, not an
     // error); `false` as the return value is an error.
     virtual bool get_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, std::string& out,
-                            bool& present, std::string& why) = 0;
+                            bool& present, std::string& why, const char* salt = "") = 0;
 
-    // The bytes one object holds, fixed for the life of the store connection.
+    // The bytes one object holds, fixed for the life of the store connection.  It carries a little more than the
+    // state's own `chunk x bytes_per_token`, so one window's record (its headers included) fits in one object.
     virtual size_t object_bytes() const = 0;
     virtual int64_t chunk_tokens() const = 0;
 };

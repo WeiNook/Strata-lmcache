@@ -25,11 +25,15 @@ namespace msgpack = lmc::msgpack;
 // call, so it is fixed here and verified on open: a server with another chunk size is refused rather than silently
 // addressed wrongly.
 constexpr int64_t kChunkTokens = 256;
+// Reserved on top of the caller's bytes-per-token: one object must hold one window's record *and* its headers
+// (a header per layer and per buffer, plus the trailer), or a window would not fit in the object it is written to.
+constexpr int64_t kObjectSlackBytesPerToken = 64;
 
 class ZmqStore : public LmcacheStore {
 public:
     ZmqStore(std::string endpoint, std::string model_name, int64_t bytes_per_token, int64_t instance_id)
-        : endpoint_(std::move(endpoint)), model_(std::move(model_name)), per_token_(std::max<int64_t>(1, bytes_per_token)),
+        : endpoint_(std::move(endpoint)), model_(std::move(model_name)),
+          per_token_(std::max<int64_t>(1, bytes_per_token) + kObjectSlackBytesPerToken),
           instance_(instance_id), rpc_(dealer_) {}
 
     bool open(std::string& why) override {
@@ -84,13 +88,23 @@ public:
     int64_t chunk_tokens() const override { return kChunkTokens; }
 
     bool put_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, const void* data, size_t bytes,
-                    std::string& why) override {
+                    std::string& why, const char* salt) override {
         if (!open_ && !open(why)) return false;
-        if (bytes != object_bytes()) {
-            why = "an object must be exactly " + std::to_string(object_bytes()) + " bytes, got " + std::to_string(bytes);
+        const size_t want = object_bytes();
+        if (bytes > want) {
+            why = "a record is " + std::to_string(bytes) + " bytes, more than the " + std::to_string(want) +
+                  "-byte object: raise STRATA_LMCACHE_BYTES_PER_TOKEN by " +
+                  std::to_string((bytes - want + size_t(kChunkTokens) - 1) / size_t(kChunkTokens)) + " or more";
             return false;
         }
-        const CacheKey key = make_key(tokens, start, end);
+        // a record shorter than the object is padded: the store holds one shape, whatever the record's own length
+        std::vector<uint8_t> padded;
+        if (bytes < want) {
+            padded.assign(want, 0);
+            if (bytes) std::memcpy(padded.data(), data, bytes);
+            data = padded.data();
+        }
+        const CacheKey key = make_key(tokens, start, end, salt);
 
         // prepare_store takes a tuple of skipped (layer, ...) groups; nothing is skipped here
         msgpack::Writer skipped;
@@ -108,7 +122,7 @@ public:
 
         // the object itself: one tile shaped exactly as the context that was registered
         msgpack::Writer env;
-        const TensorView tile{data, bytes};
+        const TensorView tile{data, want};
         encode_envelope(env, &tile, 1, 1, kChunkTokens, per_token_);
         msgpack::Writer data_wire;
         data_wire.binary(env.bytes().data(), env.bytes().size());
@@ -127,11 +141,11 @@ public:
     }
 
     bool get_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, std::string& out, bool& present,
-                    std::string& why) override {
+                    std::string& why, const char* salt) override {
         present = false;
         out.clear();
         if (!open_ && !open(why)) return false;
-        const CacheKey key = make_key(tokens, start, end);
+        const CacheKey key = make_key(tokens, start, end, salt);
         msgpack::Writer inst;
         inst.integer(instance_);
         msgpack::Writer k = key.encode();
@@ -212,9 +226,10 @@ public:
     }
 
 private:
-    CacheKey make_key(const std::vector<int32_t>& tokens, int64_t start, int64_t end) const {
+    CacheKey make_key(const std::vector<int32_t>& tokens, int64_t start, int64_t end, const char* salt = "") const {
         CacheKey key;
         key.model_name = model_;
+        key.cache_salt = salt ? salt : "";
         key.start = start;
         key.end = end;
         key.request_id = "strata";

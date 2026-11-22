@@ -102,6 +102,17 @@ private:
     bool publish_impl(const SavedConversation& image, const std::vector<SessionKvSource>* kv,
                       const std::vector<int32_t>& tokens, const SessionFileIdentity& id, std::string& why);
 
+    // How far a conversation is already in the store: a conversation only grows, so the windows written by an earlier
+    // publish do not have to be sent again.  Remembered here, not asked of the store - a lookup per window would cost
+    // as many round trips as the writes it saves.
+    struct Published {
+        std::vector<int32_t> ids;   // the tokens the windows cover (the conversation's prefix at the last publish)
+        int64_t windows = 0;
+    };
+    int64_t published_windows(const std::vector<int32_t>& tokens, int64_t chunk) const;
+    void remember_published(const std::vector<int32_t>& tokens, int64_t windows, int64_t chunk);
+    std::vector<Published> published_;   // the most recent two conversations, oldest first
+
     LmcacheSettings settings_;
     std::unique_ptr<LmcacheStore> store_;
     LmcacheStats stats_;
