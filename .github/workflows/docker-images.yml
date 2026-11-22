@@ -6,7 +6,11 @@ name: Docker images
 # For each flavor the job downloads the engine package from the release and checks it against the signed update feed
 # (tools/docker/fetch-engines.py: the feed's Ed25519 signature, the archive's SHA-256, the manifest hash, the package signature,
 # every file's hash), builds the image with tools/docker/build.sh and, only when "push" is on, pushes
-#   ghcr.io/niko1221/strata:<version>-<flavor>   and   ghcr.io/niko1221/strata:latest-<flavor>
+#   ghcr.io/<IMAGE>:<version>-<flavor>   and   ghcr.io/<IMAGE>:latest-<flavor>   (this fork: ghcr.io/weinook/strata-lmcache)
+#
+# The engine packages come from the release of Niko1221/Strata (tools/docker/fetch-engines.py's default --repo), which
+# is what makes the download verifiable: its signed feed, hashes and package signature.  To pack this fork's own
+# releases instead, add --repo <owner>/<name> to that tool's call below.
 # The first run with "push" off builds everything without publishing it (a dry run).
 
 on:
@@ -39,9 +43,12 @@ on:
 
 permissions:
   contents: read
+  packages: write   # pushing the images to ghcr.io (the fork publishes to its own package)
 
 env:
-  IMAGE: ghcr.io/niko1221/strata
+  # This fork publishes to its own package.  Uppercase owners are rejected by the registry, so the name is written
+  # lowercase; to build the upstream images again, put back ghcr.io/niko1221/strata.
+  IMAGE: ghcr.io/weinook/strata-lmcache
 
 jobs:
   plan:
