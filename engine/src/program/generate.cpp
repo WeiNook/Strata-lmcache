@@ -1298,8 +1298,8 @@ void usage() {
                  "    STRATA_LMCACHE_HTTP=...          its report plane for the monitor (default: <same host>:8080)\n"
                  "    STRATA_LMCACHE_NAMESPACE=...     the name this model registers under (default: \"strata\")\n"
                  "    STRATA_LMCACHE_MIN_TOKENS=N      do not publish prefixes shorter than this (default 8192)\n"
-                 "    STRATA_LMCACHE_REPLACE_RAM=1     the store replaces the in-process cache: publish each finished\n"
-                 "                       conversation and keep nothing here (--conversation-cache-mib 0 makes it complete)\n"
+                 "    STRATA_LMCACHE_REPLACE_RAM=1     the store replaces the in-process cache; each conversation is\n"
+                 "                       published as its response goes out (a copy; only its new windows are sent)\n"
                  "    STRATA_LMCACHE_BYTES_PER_TOKEN=N the state's bytes per token, which fixes the object shape (default 19531)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -22802,6 +22802,19 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            // The response is out.  With STRATA_LMCACHE_REPLACE_RAM the store holds this conversation's state, so it is
+            // published here rather than when a later request happens to displace it: another instance - or this one
+            // after a restart - can then serve the next turn.  It is a COPY (a park never clears the session), so the
+            // same conversation continuing here still finds its state live, and the transfer runs on the writer's
+            // thread: this request does not wait for it, and a failure costs the reuse and nothing else.
+            if (lmcache_primary && !cancelled && !live.empty()) {
+                const auto t_pub = Clock::now();
+                if (park_current(0))
+                    std::fprintf(stderr, "strata serve: shared cache: published the finished conversation in %.1f ms\n",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_pub).count());
+                else
+                    std::fprintf(stderr, "strata serve: shared cache: not published after the response\n");
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;

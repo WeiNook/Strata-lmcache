@@ -189,7 +189,12 @@ and RAM wins ties.  That matters for what this tier does and does not do.
 
 **Publishing is not triggered by a miss.**  It happens when a conversation is *evicted from RAM* - the moment it is
 leaving anyway - on a background thread, so no request ever waits for a transfer, and a store that is down only means
-the publish is skipped.  Publishing on every miss would spend bandwidth for nothing: a prompt that is not in the store
+the publish is skipped.
+
+With `STRATA_LMCACHE_REPLACE_RAM=1` it also happens **as each response goes out** (see "Making the store the only
+tier"): there the store has taken the place of the in-process cache, so waiting for a later request to displace the
+conversation would leave it invisible to the other instances that just became able to use it.  The publish is a copy,
+so this instance's next turn still finds its state live.  Publishing on every miss would spend bandwidth for nothing: a prompt that is not in the store
 yet is usually the one whose state is still live in RAM.
 
 **The SSD tier is optional.**  A host without an NVMe disk runs with it off; the shared tier then gets a writer of its
@@ -234,6 +239,9 @@ finished conversation and keeps nothing in the engine:
 --conversation-cache-mib 0            # no in-process tier at all
 STRATA_LMCACHE_REPLACE_RAM=1          # the store replaces it
 ```
+
+Each response is published **as it goes out** (a copy, on the writer's thread, with only the windows the conversation
+added), so another instance can serve the very next turn instead of reading the prompt again.
 
 What it does *not* give up is the conversation in flight: parking never touched the live state, so the next message on
 the same instance is still immediate.  What it does cost is the cross-instance case - and it is not small at a long
