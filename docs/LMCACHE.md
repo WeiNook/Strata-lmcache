@@ -94,6 +94,16 @@ STRATA_LMCACHE_NAMESPACE=qwen3.8-flash-next      # what this model registers as;
 | `STRATA_LMCACHE_BYTES_PER_TOKEN` | the state's size per token, which fixes the object shape. Both ends of a namespace must use the same value, so changing it invalidates what is stored under it | 19531 (~19 KB, this geometry) |
 | `STRATA_LMCACHE_MIN_TOKENS` | the cost gate: a prefix shorter than this is not published (the transfer would cost more than the read it saves) | 8192 |
 
+Two things bite when the store is not on the default ports or not on the same network:
+
+* **The derived HTTP URL always uses port 8080.** If the store was started with `--http-port 8086`, set
+  `STRATA_LMCACHE_HTTP=http://<host>:8086` explicitly. Otherwise the monitor polls `http://<host>:8080`, which is
+  either closed or - inside a bridge container - the engine's own HTTP server, so the page reports "Not reachable".
+* **`127.0.0.1` means the container you are in.** A store started with `--network host` listens on the host, so an
+  engine in a bridge container (the usual `-p 8083:8080` deployment) must reach it by the host's address, not
+  `127.0.0.1`. Either add `--add-host=host.docker.internal:host-gateway` and use `tcp://host.docker.internal:8085`,
+  or use the host's LAN IP. An engine that itself runs with `--network host` may keep `127.0.0.1`.
+
 Because these are ordinary engine settings, all three delivery paths work with no extra plumbing: a model file's
 `env` block, a compose/`docker run -e`, or the settings page. `docs/SETTINGS.md` is generated from the same register, so
 `python tools/settings_register.py --check` keeps code and documentation in step.
