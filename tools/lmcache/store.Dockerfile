@@ -32,8 +32,10 @@ RUN pip install --index-url "${TORCH_INDEX_URL}" torch \
 # 8080: the report plane (GET /status, what the monitor reads)
 EXPOSE 5555 8080
 
-# The report plane's port is its own flag (--http-port, 8080 by default); set LMCACHE_HTTP_PORT when you move it so the
-# health check follows.
+# The report plane's port is its own flag (--http-port, 8080 by default).  Its *address* is a separate flag too:
+# LMCache binds HTTP to 127.0.0.1 unless --http-host is given.  The entrypoint passes --http-host 0.0.0.0 so the
+# monitor (and telnet/curl) can reach it from outside the container; override with LMCACHE_HTTP_HOST if needed.
+# Set LMCACHE_HTTP_PORT when you move the port so the health check follows.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s \
     CMD python -c "import os,sys,urllib.request; p=os.environ.get('LMCACHE_HTTP_PORT','8080'); sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+p+'/healthcheck', timeout=4).status == 200 else 1)"
 

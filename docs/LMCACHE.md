@@ -59,8 +59,14 @@ docker run -d --name lmcache --network host --shm-size=8g \
   --l1-size-gb 48 --eviction-policy LRU
 ```
 
-(the command is the image's entrypoint: `lmcache server --host 0.0.0.0 --port 5555 --transport zmq
---supported-transfer-mode engine_driven`)
+(the command is the image's entrypoint: `lmcache server --host 0.0.0.0 --port 5555 --http-host 0.0.0.0
+--transport zmq --supported-transfer-mode engine_driven`)
+
+**The HTTP report plane binds to `127.0.0.1` unless you say otherwise.** LMCache 0.5.7 has two separate address flags:
+`--host` for the ZMQ data plane (5555) and `--http-host` for the HTTP report plane (8080, `/status` and `/healthcheck`).
+The entrypoint sets both to `0.0.0.0`; if you launch the server another way, add `--http-host 0.0.0.0` or the monitor,
+`curl` and `telnet` to the HTTP port will fail from outside the container even though the data port answers. To move
+the report port, pass `--http-port <port> -e LMCACHE_HTTP_PORT=<port>` (the env var keeps the health check in sync).
 
 The image's entrypoint already passes both of these, but if you start the server another way they are not optional:
 
