@@ -788,6 +788,187 @@ void a_long_file_prefix_is_shared_by_two_questions() {
 
 
 
+// The engine's writer publishes an image that ALREADY carries its K/V, so the tier cuts it with chunk_extract (a copy
+// out of the image's buffers).  Every other test here publishes the source form, which the engine only uses when the
+// K/V is pulled from its layers as it goes - two different cuts, and the one the deployment takes was untested.
+SavedConversation image_with_kv(const Session& s) {
+    SavedConversation image = s.image;
+    image.kv.resize(s.parts.size());
+    for (size_t layer = 0; layer < s.parts.size(); ++layer) {
+        ConversationKv& k = image.kv[layer];
+        const int64_t cells = int64_t(s.parts[layer][0].size() / 32);
+        k.format = 2 + int(layer);
+        k.cells = cells;
+        k.heads = 2;
+        k.head_dim = 256;
+        k.page_size = 4;
+        k.pooled_rows = cells / 4 + 1;
+        k.idx_dim = 128;
+        std::array<ConversationBuffer*, 5> dst = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t p = 0; p < 5; ++p) {
+            const std::vector<uint8_t>& src = s.parts[layer][p];
+            dst[p]->resize(src.size());
+            dst[p]->visit(0, src.size(), [&](uint8_t* q, size_t n, size_t at) {
+                std::memcpy(q, src.data() + at, n);
+                return true;
+            });
+        }
+    }
+    return image;
+}
+
+void the_image_form_the_engine_publishes() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{71, 72};
+    std::string why;
+
+    Session first = make_session(1024);
+    check(tier.publish(image_with_kv(first), id, first.tokens, why), "an image that carries its K/V publishes");
+    check(raw->puts == 1 + 4, "one head and four windows");
+    SavedConversation back;
+    check(tier.restore(first.tokens, id, back, {}, why), "and restores");
+    check(back.kv.size() == first.parts.size() && buffer_equals(back.kv[0].k, first.parts[0][0]),
+          "the K/V that came out of the image is byte for byte what went in");
+
+    Session grown = make_session(1280);
+    const int before = raw->puts;
+    check(tier.publish(image_with_kv(grown), id, grown.tokens, why), "the grown image publishes");
+    check(raw->puts - before == 1 + 1, "only the head and the new window, as with the source form");
+    check(tier.restore(grown.tokens, id, back, {}, why), "and the grown state restores");
+    check(buffer_equals(back.kv[1].pooled, grown.parts[1][4]), "including the second layer's pooled rows");
+}
+
+// One window lost (the store evicted it, or the publish was cut short) makes the chain unusable: the state's running
+// arrays belong to the whole conversation, so a shorter prefix assembled from the rest would be wrong.
+void a_missing_window_refuses_the_whole_chain() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{73, 74};
+    std::string why;
+    Session s = make_session(1024);
+    check(publish_ok(tier, s, id, "the store's copy", why), "the state publishes");
+    for (auto it = raw->objects.begin(); it != raw->objects.end(); ++it)
+        if (std::get<1>(it->first) == 512) { raw->objects.erase(it); break; }   // window 2 is gone
+
+    SavedConversation keep;
+    keep.layer_hi = 3;
+    const SavedConversation untouched = keep;
+    check(!tier.restore(s.tokens, id, keep, {}, why), "a chain missing a window is refused");
+    check(why.find("missing window 2") != std::string::npos, "and names the window");
+    check(same_state(untouched, keep), "the caller's image is untouched");
+    check(tier.stats().restored == 0, "nothing is counted as restored");
+}
+
+// What the store hands back is never trusted: every record carries its own hash and the session format's checks.  A
+// torn write, a reused key from another tool, a truncated object - all of them end as "not restored", never as a state
+// the engine would continue from.
+void a_corrupt_object_in_the_store_is_refused() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{83, 84};
+    std::string why;
+    Session s = make_session(1024);
+    check(publish_ok(tier, s, id, "the store's copy", why), "the state publishes");
+
+    for (auto& kv : raw->objects) {
+        if (std::get<1>(kv.first) == 512) { kv.second.resize(100); kv.second[40] ^= 0xff; break; }   // window 2 is torn
+    }
+    SavedConversation keep;
+    keep.layer_hi = 2;
+    const SavedConversation untouched = keep;
+    check(!tier.restore(s.tokens, id, keep, {}, why), "a torn record is refused");
+    check(!why.empty(), "with a reason");
+    check(same_state(untouched, keep), "and the caller's image is untouched");
+    check(tier.stats().restored == 0 && tier.stats().hits == 0, "nothing is counted as restored or hit");
+
+    // The head itself corrupted: the same.
+    for (auto& kv : raw->objects) {
+        if (std::get<1>(kv.first) == 0) { kv.second.assign(kv.second.size(), 0); break; }   // the head, zeroed
+    }
+    check(!tier.restore(s.tokens, id, keep, {}, why), "a zeroed head is refused too");
+    check(same_state(untouched, keep), "and the caller's image stays as it was");
+}
+
+// The store was down and comes back: the next call reconnects instead of staying broken for the process's life.
+void a_store_that_comes_back_is_used_again() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{75, 76};
+    std::string why;
+    Session s = make_session(1024);
+
+    raw->fail_open = true;
+    check(!tier.publish(s.image, s.kv, s.tokens, id, why), "a store that is down refuses the publish");
+    check(tier.stats().connected == false, "and says it is not connected");
+    raw->fail_open = false;
+    check(tier.publish(s.image, s.kv, s.tokens, id, why), "the same tier publishes once the store answers again");
+    check(tier.stats().connected, "and is connected again");
+    SavedConversation back;
+    check(tier.restore(s.tokens, id, back, {}, why), "and reads back");
+}
+
+// A client that rewinds history (an edited turn, a compacted conversation) asks for a SHORTER prefix than the last
+// publish: the windows the store holds beyond it are not this conversation's any more, so they are written again.
+void a_rewound_conversation_is_published_again() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{77, 78};
+    std::string why;
+    Session long_s = make_session(1280);
+    check(publish_ok(tier, long_s, id, "the long turn", why), "a 1280-token conversation publishes");
+    Session short_s = make_session(1024);   // its own prefix, one window shorter
+    const int before = raw->puts;
+    check(publish_ok(tier, short_s, id, "the rewind", why), "the rewound one publishes");
+    check(raw->puts - before == 1 + 4, "all four windows again, not the ones past the new end");
+    SavedConversation back;
+    check(tier.restore(short_s.tokens, id, back, {}, why), "and restores at the shorter length");
+    check(back.live.ids == short_s.tokens, "with the rewound tokens");
+}
+
+// A layer split (several cards, one image per stage) cannot be cut into windows: the shared tier stays out of it, and
+// says so instead of writing something a reader could not use.
+void a_layer_split_state_is_not_published() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{79, 80};
+    std::string why;
+    Session s = make_session(1024);
+    SavedConversation split = image_with_kv(s);
+    split.stage_images.push_back(s.image);   // the later stage's own image
+
+    check(!tier.publish(split, id, s.tokens, why), "a layer-split state is not published");
+    check(raw->puts == 0, "nothing reaches the store");
+    check(why.find("layer-split") != std::string::npos, "and the reason says why");
+}
+
+// The engine refuses a read its RAM preflight cannot afford before anything is parsed; the tier must pass that through
+// without touching the caller's image.
+void a_read_the_ram_preflight_refuses_leaves_the_caller_alone() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{81, 82};
+    std::string why;
+    Session s = make_session(1024);
+    check(publish_ok(tier, s, id, "the store's copy", why), "the state publishes");
+
+    SessionReadLimits limits;
+    limits.admit = [](uint64_t, std::string& w) { w = "no room for it"; return false; };
+    SavedConversation keep;
+    keep.layer_hi = 5;
+    const SavedConversation untouched = keep;
+    check(!tier.restore(s.tokens, id, keep, limits, why), "a read the RAM preflight refuses fails");
+    check(why.find("no room") != std::string::npos, "with the preflight's reason");
+    check(same_state(untouched, keep), "and the caller's image is untouched");
+}
+
 // One instance keeps a conversation in its own RAM tier and in the store at the same time.  The rule is "the longer
 // prefix wins" (generate.cpp: the store is only used when it beats `resume`, the batch slot and the parked
 // conversation), and a turn the RAM tier wins must not pay for the store's state: the head alone says how long it is.
@@ -883,6 +1064,27 @@ int live(const std::string& endpoint) {
         kv_ok = buffer_equals(back.kv[layer].k, session.parts[layer][0]) &&
                 buffer_equals(back.kv[layer].pooled, session.parts[layer][4]);
     check(kv_ok, "live: the K/V came back byte for byte");
+
+    // The form the engine's writer really publishes: the K/V inside the image, cut by chunk_extract.  The round trip
+    // above used the source form (chunk_extract_from), which the engine only uses when the layers are read in place.
+    {
+        Session in_image = make_session(1280, 41);
+        SavedConversation picture = image_with_kv(in_image);
+        const SessionFileIdentity iid{0x2222333344445555ull, 0x6666777788889999ull};
+        if (!tier.publish(picture, iid, in_image.tokens, why)) {
+            std::fprintf(stderr, "live image publish: %s\n", why.c_str());
+            return 2;
+        }
+        SavedConversation got;
+        if (!tier.restore(in_image.tokens, iid, got, {}, why)) {
+            std::fprintf(stderr, "live image restore: %s\n", why.c_str());
+            return 2;
+        }
+        check(same_state(picture, got), "live: an image that carries its K/V round-trips");
+        check(got.kv.size() == in_image.parts.size() && buffer_equals(got.kv[0].k, in_image.parts[0][0]) &&
+                  buffer_equals(got.kv[1].pooled, in_image.parts[1][4]),
+              "live: with both layers byte for byte");
+    }
 
     // The deployment this was written for runs four engines against one store: what one publishes, another reads.
     // A second instance (another instance_id, same model and geometry) must find the first one's session.
@@ -1056,6 +1258,13 @@ int main(int argc, char** argv) {
     a_picture_inside_the_prefix_gates_the_match();
     a_long_file_prefix_is_shared_by_two_questions();
     a_state_the_caller_already_beats_is_not_transferred();
+    the_image_form_the_engine_publishes();
+    a_missing_window_refuses_the_whole_chain();
+    a_corrupt_object_in_the_store_is_refused();
+    a_store_that_comes_back_is_used_again();
+    a_rewound_conversation_is_published_again();
+    a_layer_split_state_is_not_published();
+    a_read_the_ram_preflight_refuses_leaves_the_caller_alone();
     the_longer_of_the_ram_tier_and_the_store_wins();
     int rc = 0;
     if (argc > 1) rc = live(argv[1]);
