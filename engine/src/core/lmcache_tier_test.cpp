@@ -589,14 +589,16 @@ int live(const std::string& endpoint) {
         g.min_tokens = 8192;
         LmcacheTier gated(g, lmcache_zmq_store(g.rpc, g.model, g.bytes_per_token, 9920));
         const SessionFileIdentity bid{0xaaaabbbbccccddddull, 0x1111222233334444ull};
-        Session big = make_session(9000);
+        Session big = make_session(9216);   // 36 whole chunks: the fixture's cells and live ids stay consistent
         if (!gated.publish(big.image, big.kv, big.tokens, bid, why)) {
             std::fprintf(stderr, "live gated publish: %s\n", why.c_str());
             return 2;
         }
         SavedConversation got;
-        check(gated.restore(big.tokens, bid, got, {}, why), "live: a 9000-token session at the 8192 gate restores");
-        check(same_state(big.image, got), "live: the 9000-token state came back identical");
+        const bool restored = gated.restore(big.tokens, bid, got, {}, why);
+        if (!restored) std::fprintf(stderr, "live gated restore: %s\n", why.c_str());
+        check(restored, "live: a 9216-token session at the 8192 gate restores");
+        check(same_state(big.image, got), "live: the 9216-token state came back identical");
 
         Session small = make_session(8000);   // below the 8192 gate
         SavedConversation none;

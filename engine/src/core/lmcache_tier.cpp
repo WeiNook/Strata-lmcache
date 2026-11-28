@@ -245,7 +245,10 @@ bool LmcacheTier::publish_impl(const SavedConversation& image, const std::vector
             k.cells = 0;
             k.pooled_rows = 0;
         }
-        if (!put_record(*store_, meta, nullptr, tokens, 0, chunk, "meta", id, why)) {
+        // The meta record's key follows the conversation's length, not a fixed [0, chunk): the store never replaces
+        // an object it already has, so a key pinned to the first chunk would freeze the running state, the tokens
+        // and the identity at the first publish and every longer turn would read that stale record back.
+        if (!put_record(*store_, meta, nullptr, tokens, 0, total * chunk, "meta", id, why)) {
             ++stats_.failed;
             stats_.connected = false;
             return false;
@@ -329,17 +332,26 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
     //    and the running state they belong to.
     SavedConversation meta;
     bool present = false;
-    if (!get_record(*store_, tokens, 0, chunk, "meta", id, limits, meta, present, why)) {
-        ++stats_.failed;
-        stats_.connected = false;
-        return false;
+    // The meta record is keyed by the conversation's length (see publish): the store keeps the first object it was
+    // given for a key, so a key pinned to the first chunk would freeze the running state, the tokens and the identity
+    // at the first publish.  This prompt is at least as long as the one that was published, so walk the whole-chunk
+    // lengths down until the record is found.  A miss costs one lookup; a store that does not answer returns above.
+    const int64_t want = (int64_t(tokens.size()) / chunk) * chunk;
+    int64_t meta_end = 0;
+    for (int64_t end = want, tries = 0; end >= chunk && tries < 8; end -= chunk, ++tries) {
+        if (!get_record(*store_, tokens, 0, end, "meta", id, limits, meta, present, why)) {
+            ++stats_.failed;
+            stats_.connected = false;
+            return false;
+        }
+        if (present) { meta_end = end; break; }
     }
-    if (!present) {
+    if (!present || meta_end == 0) {
         stats_.connected = true;   // the store answered: it simply does not have this prefix
         why = "no session for this prefix";
         return false;
     }
-    const int64_t total = int64_t(meta.live.ids.size()) / chunk;
+    const int64_t total = meta_end / chunk;
     if (total <= 0) {
         stats_.connected = true;
         why = "the store's record holds no whole chunk";
