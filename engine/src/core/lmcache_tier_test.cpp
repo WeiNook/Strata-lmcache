@@ -387,6 +387,30 @@ void cost_gate_refuses_short_prefixes() {
     check(raw->puts == 0, "not a single object was transferred");
 }
 
+// The restore side takes the same gate the publish side has.  Without it every request - a two-line question
+// included - probes the store, and a store that accepts a lookup without answering holds the prefill for the whole
+// lookup timeout before anything is computed (30 s, measured on the deployment this test was written for).
+void restore_gate_refuses_short_prefixes() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{13, 14};
+    SavedConversation back;
+    std::string why;
+
+    const Session short_s = make_session(53);   // below the 512-token gate
+    check(!tier.restore(short_s.tokens, id, back, {}, why), "a short prefix is not restored");
+    check(raw->gets == 0, "the store is not asked below the cost gate");
+    check(tier.stats().probes == 1, "the skipped probe is still counted");
+    check(why.find("cost gate") != std::string::npos, "the reason names the cost gate");
+
+    // Above the gate the store is asked, and this one holds nothing: a miss, not an error.
+    const Session long_s = make_session(600);
+    check(!tier.restore(long_s.tokens, id, back, {}, why), "a prefix above the gate is looked up and misses");
+    check(raw->gets > 0, "the store is asked above the cost gate");
+    check(tier.stats().probes == 2, "both probes are counted");
+}
+
 void prefix_is_cut_at_chunk_boundaries() {
     Session s = make_session(1000);   // 3 whole chunks of 256, 232 tokens left over
     auto store = std::make_unique<FakeStore>(kPerToken + 64);
@@ -519,6 +543,7 @@ int main(int argc, char** argv) {
     publish_restore_roundtrip();
     only_new_windows_are_sent();
     cost_gate_refuses_short_prefixes();
+    restore_gate_refuses_short_prefixes();
     prefix_is_cut_at_chunk_boundaries();
     a_store_failure_is_never_fatal();
     a_miss_is_not_an_error();
