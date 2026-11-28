@@ -118,6 +118,8 @@ void settings_surface() {
     clear_all();
 }
 
+// The one INFO line the engine prints at start-up and per transfer: an operator reads the tier's whole configuration
+// and effect there, so its shape is pinned.
 void info_lines() {
     LmcacheSettings s;
     LmcacheStats st;
@@ -399,6 +401,7 @@ bool publish_ok(LmcacheTier& tier, const Session& s, const SessionFileIdentity& 
     return ok;
 }
 
+// The base promise: a conversation published to the store comes back as the same state, K/V included.
 void publish_restore_roundtrip() {
     Session s = make_session(1024);
     LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(kPerToken + 64));
@@ -454,6 +457,7 @@ void only_new_windows_are_sent() {
     check(raw->puts - steady == 1, "with nothing new, only the record is rewritten");
 }
 
+// A prefix too short to pay for its own transfer is not published: below the gate nothing is written at all.
 void cost_gate_refuses_short_prefixes() {
     Session s = make_session(300);   // below the 512-token gate
     auto store = std::make_unique<FakeStore>(kPerToken + 64);
@@ -509,6 +513,8 @@ void restore_gate_boundary() {
     check(raw->gets > 0, "512 tokens does reach the store");
 }
 
+// The stored prefix floors to a whole chunk, and what comes back is exactly that prefix - the tail that never filled
+// a window is recomputed, not invented.
 void prefix_is_cut_at_chunk_boundaries() {
     Session s = make_session(1000);   // 3 whole chunks of 256, 232 tokens left over
     auto store = std::make_unique<FakeStore>(kPerToken + 64);
@@ -533,6 +539,8 @@ void prefix_is_cut_at_chunk_boundaries() {
           "the restored K is the prefix the store was given");
 }
 
+// A refusing or unreachable store only costs the reuse: publish reports it, restore leaves the caller's image as it
+// was, and the request goes on.
 void a_store_failure_is_never_fatal() {
     Session s = make_session(1024);
     auto store = std::make_unique<FakeStore>(kPerToken + 64);
@@ -559,6 +567,7 @@ void a_store_failure_is_never_fatal() {
     check(same_state(before, keep), "a failed restore leaves the caller's image untouched");
 }
 
+// Nothing stored is a miss (a probe, no hit, no failure) - the shape the engine's counters depend on.
 void a_miss_is_not_an_error() {
     Session s = make_session(1024);
     LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(kPerToken + 64));
@@ -570,6 +579,7 @@ void a_miss_is_not_an_error() {
     check(tier.stats().failed == 0, "a miss is not a failure");
 }
 
+// A session saved under another model or engine configuration is refused before any of its payload is parsed.
 void another_identity_is_refused() {
     Session s = make_session(1024);
     LmcacheTier tier(test_settings(), std::make_unique<FakeStore>(kPerToken + 64));
@@ -584,6 +594,8 @@ void another_identity_is_refused() {
     check(out.geometry == std::array<int64_t, 18>{}, "the caller's image stays empty");
 }
 
+// No STRATA_LMCACHE: publish and restore are no-ops and INFO says the tier is off - a model that never configured it
+// behaves exactly as before this feature.
 void disabled_tier_does_nothing() {
     LmcacheSettings off;   // enabled = false
     LmcacheTier tier(off, std::make_unique<FakeStore>(kPerToken + 64));
@@ -817,6 +829,7 @@ SavedConversation image_with_kv(const Session& s) {
     return image;
 }
 
+// The form the writer really publishes: the K/V already inside the image, cut by chunk_extract.
 void the_image_form_the_engine_publishes() {
     auto store = std::make_unique<FakeStore>(kPerToken + 64);
     FakeStore* raw = store.get();
