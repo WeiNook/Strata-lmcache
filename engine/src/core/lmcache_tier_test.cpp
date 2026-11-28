@@ -581,6 +581,28 @@ int live(const std::string& endpoint) {
         t2.join();
         check(hits.load() == 16, "live: 16 concurrent reads on two engines all hit");
     }
+
+    // The production gate is 8192, not the fixture's 256, and a real conversation is far longer than 1024 tokens:
+    // 9000 tokens is 36 windows and ~3.6 MB through the store, which is the size class the deployment moves.
+    {
+        LmcacheSettings g = s;
+        g.min_tokens = 8192;
+        LmcacheTier gated(g, lmcache_zmq_store(g.rpc, g.model, g.bytes_per_token, 9920));
+        const SessionFileIdentity bid{0xaaaabbbbccccddddull, 0x1111222233334444ull};
+        Session big = make_session(9000);
+        if (!gated.publish(big.image, big.kv, big.tokens, bid, why)) {
+            std::fprintf(stderr, "live gated publish: %s\n", why.c_str());
+            return 2;
+        }
+        SavedConversation got;
+        check(gated.restore(big.tokens, bid, got, {}, why), "live: a 9000-token session at the 8192 gate restores");
+        check(same_state(big.image, got), "live: the 9000-token state came back identical");
+
+        Session small = make_session(8000);   // below the 8192 gate
+        SavedConversation none;
+        check(!gated.restore(small.tokens, bid, none, {}, why), "live: 8000 tokens is below the 8192 gate");
+        check(why.find("cost gate") != std::string::npos, "live: the gate names itself");
+    }
     const auto& st = tier.stats();
     std::printf("live: published=%lld (%lld MiB) restored=%lld (%lld MiB) hit=%lld failed=%lld last_ms=%lld\n",
                 (long long) st.published, (long long) (st.published_bytes >> 20), (long long) st.restored,
