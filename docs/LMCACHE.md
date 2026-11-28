@@ -214,8 +214,11 @@ and RAM wins ties.  That matters for what this tier does and does not do.
 1. what the engine already holds - the parked state, the batch slot's, the RAM tier's best entry (`parked`) - which is
    the floor every later step has to beat;
 2. an image the background writer still holds in RAM (it was only on its way to disk);
-3. **the shared store** (this tier): the session for this prefix is fetched and then *compared* - if it does not start
-   a longer stretch of this prompt than the RAM tier already does, it is dropped and RAM's choice stands;
+3. **the shared store** (this tier): its head is read first (one small object), which says how long the session is.  A
+   session no longer than the floor above is refused right there - the windows are never transferred, so a turn the RAM
+   tier wins costs one round trip and a few KB instead of the whole state.  Only when it *is* longer are its windows
+   read, and then compared as before: a session that does not start a longer stretch of this prompt than the RAM tier
+   already does is dropped and RAM's choice stands;
 4. the local SSD tier, under the same rule;
 5. taking or borrowing from the RAM tier.
 

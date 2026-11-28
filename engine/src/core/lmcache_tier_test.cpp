@@ -788,6 +788,73 @@ void a_long_file_prefix_is_shared_by_two_questions() {
 
 
 
+// One instance keeps a conversation in its own RAM tier and in the store at the same time.  The rule is "the longer
+// prefix wins" (generate.cpp: the store is only used when it beats `resume`, the batch slot and the parked
+// conversation), and a turn the RAM tier wins must not pay for the store's state: the head alone says how long it is.
+void the_longer_of_the_ram_tier_and_the_store_wins() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{53, 54};
+    std::string why;
+
+    Session store_side = make_session(1280);            // what another engine published
+    check(publish_ok(tier, store_side, id, "the store's copy", why), "the store holds a 1280-token state");
+    std::vector<int32_t> prompt = store_side.tokens;    // the next turn starts with it and goes on
+    prompt.push_back(4242);
+
+    ConversationCache ram(8u << 20, 2);                 // the RAM tier, as --serve builds it
+    Session ram_side = make_session(768);
+    check(ram.put(SavedConversation(ram_side.image)), "the RAM tier holds a 768-token state");
+    const auto parked = ram.best(prompt, {}, false);
+    check(parked.tokens == 768, "the RAM tier offers this prompt 768 tokens");
+
+    SavedConversation back;
+    check(tier.restore(prompt, id, parked.tokens, back, {}, why), "the store's longer state is read");
+    const int64_t from_store = conversation_prefix(back.live, prompt, {});
+    check(from_store == 1280, "and it gives this prompt 1280 tokens");
+    check(from_store > parked.tokens, "more than the RAM tier's 768, so the store wins");
+
+    // The other way round: the RAM tier holds the longer conversation.
+    Session longer_ram = make_session(1536);
+    ConversationCache ram2(8u << 20, 2);
+    check(ram2.put(SavedConversation(longer_ram.image)), "the RAM tier holds a 1536-token state");
+    std::vector<int32_t> next = longer_ram.tokens;
+    next.push_back(99);
+    const auto best = ram2.best(next, {}, false);
+    check(best.tokens == 1536, "which offers this prompt 1536 tokens");
+
+    const int before = raw->gets;
+    check(!tier.restore(next, id, best.tokens, back, {}, why), "a store state shorter than the RAM tier's is not used");
+    // one lookup for the prompt's own length (a miss), one for the head that is there - and no window at all
+    check(raw->gets - before == 2, "only heads were asked for: the five windows were never transferred");
+    check(why.find("not longer than the RAM tier") != std::string::npos, "and the reason names the RAM tier");
+
+    // A store state one window longer than the RAM tier's is read in full.
+    const int before_read = raw->gets;
+    check(tier.restore(prompt, id, 768, back, {}, why), "one window longer than the RAM tier is read");
+    check(raw->gets - before_read == 1 + 5, "its head and its five windows");
+}
+
+// The same rule, at the tier's own boundary: a state no longer than the caller's prefix is refused after its head.
+void a_state_the_caller_already_beats_is_not_transferred() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{51, 52};
+    std::string why;
+    Session s = make_session(1024);
+    check(publish_ok(tier, s, id, "the store's copy", why), "a 1024-token state publishes");
+
+    const int before = raw->gets;
+    SavedConversation back;
+    check(!tier.restore(s.tokens, id, 1024, back, {}, why), "a state as long as the caller's prefix is refused");
+    check(raw->gets - before == 1, "only its head was read");
+    check(tier.stats().restored == 0, "nothing was counted as restored");
+    check(tier.stats().hits == 0, "nor as a hit");
+    check(back.live.ids.empty(), "and the caller's image stays empty");
+}
+
 // ---- against a real store, when an endpoint is given ------------------------------------------------------------
 
 int live(const std::string& endpoint) {
@@ -988,6 +1055,8 @@ int main(int argc, char** argv) {
     a_picture_is_never_served_for_another_picture();
     a_picture_inside_the_prefix_gates_the_match();
     a_long_file_prefix_is_shared_by_two_questions();
+    a_state_the_caller_already_beats_is_not_transferred();
+    the_longer_of_the_ram_tier_and_the_store_wins();
     int rc = 0;
     if (argc > 1) rc = live(argv[1]);
     std::printf("lmcache_tier_test: %d checks, %d failed\n", checks, failures);

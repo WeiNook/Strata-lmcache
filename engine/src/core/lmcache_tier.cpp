@@ -350,6 +350,16 @@ void LmcacheTier::remember_published(const std::vector<int32_t>& tokens, int64_t
 
 bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, SavedConversation& out,
                           const SessionReadLimits& limits, std::string& why) {
+    return restore_impl(tokens, id, 0, out, limits, why);   // no RAM prefix to beat
+}
+
+bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, int64_t floor_tokens,
+                          SavedConversation& out, const SessionReadLimits& limits, std::string& why) {
+    return restore_impl(tokens, id, floor_tokens, out, limits, why);
+}
+
+bool LmcacheTier::restore_impl(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, int64_t floor_tokens,
+                               SavedConversation& out, const SessionReadLimits& limits, std::string& why) {
     why.clear();
     if (!enabled()) {
         why = "the shared cache is off";
@@ -408,6 +418,14 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
     if (!std::equal(head.live.ids.begin(), head.live.ids.end(), tokens.begin())) {
         stats_.connected = true;
         why = "the head belongs to another conversation with the same opening tokens";
+        return false;
+    }
+    // Not longer than what the caller already holds in its own RAM tier: it could never be used, and a turn that the
+    // RAM tier wins must not pay for the store's whole state.  The head alone was enough to know.
+    if (total * chunk <= floor_tokens) {
+        stats_.connected = true;
+        why = "the store's state is not longer than the RAM tier's (" + std::to_string(total * chunk) + " <= " +
+              std::to_string(floor_tokens) + " tokens)";
         return false;
     }
     // 2. the first window: it gives the image its shape, and loses the head's running state onto it.

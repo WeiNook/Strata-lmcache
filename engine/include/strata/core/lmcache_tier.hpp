@@ -96,12 +96,20 @@ public:
     // Read a session back.  False + `why` for "the store has no session for this prefix" as well as for a real error;
     // `out` is untouched unless the whole stream was restored and validated.  A state that was computed for other
     // pictures is refused by the caller's own check (conversation_prefix), not here.
+    //
+    // `floor_tokens`: the prefix the caller already holds in its own RAM tier.  A store state no longer than that can
+    // never be used (the caller takes the longer of the two), so only the head is read and the windows are never
+    // transferred - one small object instead of the whole state on every turn that the RAM tier wins.
     bool restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, SavedConversation& out,
                  const SessionReadLimits& limits, std::string& why);
+    bool restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, int64_t floor_tokens,
+                 SavedConversation& out, const SessionReadLimits& limits, std::string& why);
 
 private:
     bool publish_impl(const SavedConversation& image, const std::vector<SessionKvSource>* kv,
                       const std::vector<int32_t>& tokens, const SessionFileIdentity& id, std::string& why);
+    bool restore_impl(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, int64_t floor_tokens,
+                      SavedConversation& out, const SessionReadLimits& limits, std::string& why);
 
     // How far a conversation is already in the store: a conversation only grows, so the windows written by an earlier
     // publish do not have to be sent again.  Remembered here, not asked of the store - a lookup per window would cost

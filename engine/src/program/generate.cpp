@@ -18824,6 +18824,10 @@ int main(int argc, char** argv) {
                 }
                 if (have_id) {
                     const auto t0 = Clock::now();
+                    // What this request already has without the store (its own live state, the batch slot it was given
+                    // and its parked conversation): a store state no longer than this can never be used, so the tier
+                    // reads its head only and leaves the windows where they are.
+                    const int64_t floor_tokens = std::max({resume, slot_tokens, parked.tokens});
                     strata::core::SavedConversation image;
                     std::string why;
                     bool got = false;
@@ -18843,7 +18847,7 @@ int main(int argc, char** argv) {
                         if (strata::core::conversation_session_read_limits(limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
                                 (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why)) {
                             std::lock_guard<std::mutex> lk(lmcache_mu);
-                            got = lmcache_tier->restore(lc_ids, lc_id, image, limits, why);
+                            got = lmcache_tier->restore(lc_ids, lc_id, floor_tokens, image, limits, why);
                         }
                     } catch (const std::bad_alloc&) {
                         why = "not enough RAM to read it";
@@ -18852,7 +18856,6 @@ int main(int argc, char** argv) {
                         // Only when it gives THIS prompt a longer start than the RAM tier already does: a stale, short
                         // entry in the store must never displace a longer state the engine already holds.
                         const auto matched = strata::core::conversation_image_prefix(image, ids, req_imgs, want_cvec);
-                        const int64_t floor_tokens = std::max({resume, slot_tokens, parked.tokens});
                         if (matched.first > floor_tokens) {
                             std::fprintf(stderr, "strata serve: shared cache: read %zu tokens back in %.1f ms (this prompt "
                                                  "starts with %lld of them); %s", image.live.ids.size(),
