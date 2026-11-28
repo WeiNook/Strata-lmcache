@@ -310,6 +310,14 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
         return false;
     }
     ++stats_.probes;
+    // The same cost gate the publish side has.  Without it every request - including a two-line question whose prefix
+    // is far below the gate - probes the store, and a store that does not answer costs the caller the whole lookup
+    // timeout before the prefill can start.  Below the gate a transfer could never pay for the read it saves anyway.
+    if (int64_t(tokens.size()) < settings_.min_tokens) {
+        why = "prefix of " + std::to_string(tokens.size()) + " tokens is below the cost gate (" +
+              std::to_string(settings_.min_tokens) + ")";
+        return false;
+    }
     if (!store_->open(why)) {
         ++stats_.failed;
         stats_.connected = false;

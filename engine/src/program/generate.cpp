@@ -13958,14 +13958,22 @@ int main(int argc, char** argv) {
                     image.stage_images.push_back(std::move(part));
                 }
                 if (lmcache_primary && share_writer) {
-                    // published on the writer's thread and kept nowhere here: the RAM this capture used goes back
-                    // as soon as the transfer is done, and the next request - on any instance - reads it from the store
+                    // Published on the writer's thread, and kept in this process's RAM tier as well when that tier is
+                    // on (--conversation-cache-slots / --conversation-cache-mib): a turn that comes back to THIS
+                    // instance is then served without a store round trip, and the store still gets the image for the
+                    // other instances.  With the tier off (`--conversation-cache-mib 0`) the capture goes to the store
+                    // only, which is the old REPLACE_RAM behaviour.
                     const size_t captured = image.bytes();
                     const size_t tokens = src.ids.size();
                     const auto t1 = Clock::now();
+                    if (conversations.enabled() && conversations.wants((int64_t) tokens)) {
+                        strata::core::SavedConversation keep = image;   // the RAM tier's copy; the store takes the original
+                        (void) conversations.put(std::move(keep));
+                    }
                     share_writer->push(std::move(image));
-                    std::fprintf(stderr, "strata serve: shared cache: handed %zu tokens (%zu MiB) to the store instead of the RAM tier "
-                                         "in %.1f ms\n", tokens, captured >> 20,
+                    std::fprintf(stderr, "strata serve: shared cache: handed %zu tokens (%zu MiB) to the store%s in %.1f ms\n",
+                                 tokens, captured >> 20,
+                                 conversations.enabled() ? " and kept in the RAM tier" : "",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t1).count());
                     return true;
                 }

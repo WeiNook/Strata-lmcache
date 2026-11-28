@@ -160,7 +160,10 @@ public:
             std::string(tp.bytes().begin(), tp.bytes().end()),
         };
         msgpack::Value hit;
-        if (!rpc_.call(Op::lookup, lookup_args, hit, why, 30000)) return false;
+        // A lookup is on the request's critical path: it runs before the prefill can start.  A store that accepts the
+        // request but never answers must not cost more than a moment - the caller then treats it as a miss and
+        // prefills.  Four seconds covers a busy store; thirty froze the first token of every request.
+        if (!rpc_.call(Op::lookup, lookup_args, hit, why, 4000)) return false;
         bool found = false;
         if (hit.kind == msgpack::Value::Kind::array) {   // per-chunk flags: any non-zero entry is a hit
             for (const auto& v : hit.arr) {
@@ -190,8 +193,8 @@ public:
         msgpack::Value ignored;
         std::string release_why;
         bool success = false;
-        for (int attempt = 0; attempt < 50 && !success; ++attempt) {
-            if (!rpc_.call(Op::prepare_retrieve, args, reply, why, 120000)) return false;
+        for (int attempt = 0; attempt < 20 && !success; ++attempt) {
+            if (!rpc_.call(Op::prepare_retrieve, args, reply, why, 10000)) return false;
             const msgpack::Value* ok = reply.find("success");
             success = ok && ok->b;
             if (!success) {
