@@ -6,12 +6,14 @@
 #include "strata/core/lmcache_tier.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -411,6 +413,24 @@ void restore_gate_refuses_short_prefixes() {
     check(tier.stats().probes == 2, "both probes are counted");
 }
 
+// The gate is a floor, not a fudge: one token below it the store is never asked, one token at it is.
+void restore_gate_boundary() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));   // min_tokens = 512
+    const SessionFileIdentity id{15, 16};
+    SavedConversation back;
+    std::string why;
+
+    const Session below = make_session(511);
+    check(!tier.restore(below.tokens, id, back, {}, why), "511 tokens is below the gate");
+    check(raw->gets == 0, "511 tokens never reaches the store");
+
+    const Session at = make_session(512);
+    check(!tier.restore(at.tokens, id, back, {}, why), "512 tokens is at the gate (this store has nothing: a miss)");
+    check(raw->gets > 0, "512 tokens does reach the store");
+}
+
 void prefix_is_cut_at_chunk_boundaries() {
     Session s = make_session(1000);   // 3 whole chunks of 256, 232 tokens left over
     auto store = std::make_unique<FakeStore>(kPerToken + 64);
@@ -529,6 +549,38 @@ int live(const std::string& endpoint) {
         kv_ok = buffer_equals(back.kv[layer].k, session.parts[layer][0]) &&
                 buffer_equals(back.kv[layer].pooled, session.parts[layer][4]);
     check(kv_ok, "live: the K/V came back byte for byte");
+
+    // The deployment this was written for runs four engines against one store: what one publishes, another reads.
+    // A second instance (another instance_id, same model and geometry) must find the first one's session.
+    {
+        LmcacheTier second(s, lmcache_zmq_store(s.rpc, s.model, s.bytes_per_token, 9912));
+        SavedConversation other;
+        if (!second.restore(session.tokens, id, other, {}, why)) {
+            std::fprintf(stderr, "live second engine restore: %s\n", why.c_str());
+            return 2;
+        }
+        check(same_state(session.image, other), "live: a second engine reads what the first published");
+    }
+
+    // Both at once, as two requests arriving on two instances.  The key's request_id is the same on every engine,
+    // so this is the case where a store that keys its prefetch state by it would make the two collide: every read
+    // must still hit.
+    {
+        LmcacheTier a(s, lmcache_zmq_store(s.rpc, s.model, s.bytes_per_token, 9913));
+        LmcacheTier b(s, lmcache_zmq_store(s.rpc, s.model, s.bytes_per_token, 9914));
+        std::atomic<int> hits{0};
+        auto hammer = [&](LmcacheTier& t, int rounds) {
+            for (int i = 0; i < rounds; ++i) {
+                SavedConversation got;
+                std::string w;
+                if (t.restore(session.tokens, id, got, {}, w)) ++hits;
+            }
+        };
+        std::thread t1(hammer, std::ref(a), 8), t2(hammer, std::ref(b), 8);
+        t1.join();
+        t2.join();
+        check(hits.load() == 16, "live: 16 concurrent reads on two engines all hit");
+    }
     const auto& st = tier.stats();
     std::printf("live: published=%lld (%lld MiB) restored=%lld (%lld MiB) hit=%lld failed=%lld last_ms=%lld\n",
                 (long long) st.published, (long long) (st.published_bytes >> 20), (long long) st.restored,
@@ -544,6 +596,7 @@ int main(int argc, char** argv) {
     only_new_windows_are_sent();
     cost_gate_refuses_short_prefixes();
     restore_gate_refuses_short_prefixes();
+    restore_gate_boundary();
     prefix_is_cut_at_chunk_boundaries();
     a_store_failure_is_never_fatal();
     a_miss_is_not_an_error();
