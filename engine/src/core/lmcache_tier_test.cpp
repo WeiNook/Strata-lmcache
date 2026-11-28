@@ -7,13 +7,16 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -158,9 +161,19 @@ void info_lines() {
 
 // ---- a store that behaves like the real one, in memory ----------------------------------------------------------
 
+// LMCache keeps the FIRST object it was given for a key: a second put of the same key is accepted and ignored.  That
+// is not a detail - it is why a record's key has to be right before anything is written, and why this fixture keeps
+// the first too (an overwriting store would hide exactly the bug the picture key fixes).  The key itself is the salt,
+// the start and a hash of the prefix up to the record's end - the same three things lmcache hashes - so two
+// conversations never share an object here either.
 class FakeStore : public LmcacheStore {
 public:
     explicit FakeStore(int64_t per_token) : per_token_(per_token) {}
+
+    static uint64_t prefix_digest(const std::vector<int32_t>& tokens, int64_t end) {
+        const size_t up_to = size_t(std::min<int64_t>(end, int64_t(tokens.size())));
+        return session_hash64(tokens.data(), up_to * sizeof(int32_t), 0x9e3779b97f4a7c15ull);
+    }
 
     bool open(std::string& why) override {
         if (fail_open) { why = "the store is unreachable"; return false; }
@@ -178,10 +191,14 @@ public:
         if (fail_put) { why = "the store refused the object"; return false; }
         if (bytes > object_bytes()) { why = "a record is larger than its object"; return false; }
         const std::string kind(salt ? salt : "");
-        if (kind.empty() && end - start != chunk_tokens()) { why = "wrong chunk range"; return false; }
+        // The store resolves a key's token range into one object per chunk and demands one tensor for each: a record
+        // that spans more than one chunk is refused (the deployment's own store raises on the count mismatch).
+        if (end - start != chunk_tokens()) { why = "one record must be one object"; return false; }
         if (end > int64_t(tokens.size())) { why = "object past the prefix"; return false; }
-        objects[{kind, start}].assign(static_cast<const char*>(data), bytes);
-        if (kind.empty() && end > max_end) max_end = end;
+        ++offered;
+        objects.emplace(ObjectKey{kind, start, prefix_digest(tokens, end)},
+                        std::string(static_cast<const char*>(data), bytes));   // first wins
+        if (end > max_end) max_end = end;
         return true;
     }
 
@@ -190,7 +207,7 @@ public:
         ++gets;
         if (fail_get) { why = "the store is unreachable"; return false; }
         const std::string kind(salt ? salt : "");
-        const auto it = objects.find({kind, start});
+        const auto it = objects.find(ObjectKey{kind, start, prefix_digest(tokens, end)});
         if (it == objects.end()) { present = false; return true; }
         if (end > int64_t(tokens.size())) { why = "the prefix is shorter than the stored session"; return false; }
         present = true;
@@ -200,13 +217,38 @@ public:
 
     // test knobs
     bool fail_open = false, fail_put = false, fail_get = false;
-    int puts = 0, gets = 0;
+    int puts = 0, gets = 0, offered = 0;
     int64_t max_end = 0;
-    std::map<std::pair<std::string, int64_t>, std::string> objects;   // (kind, start): "" = a K/V window
+    // (salt, start, the prefix the object belongs to)
+    using ObjectKey = std::tuple<std::string, int64_t, uint64_t>;
+    std::map<ObjectKey, std::string> objects;
 
 private:
     int64_t per_token_;
     bool open_ = false;
+};
+
+// A second engine's view of one store: several LmcacheTier objects, each owning its own connection, all reaching the
+// same objects - which is what four containers on one host do.
+class ProxyStore : public LmcacheStore {
+public:
+    explicit ProxyStore(std::shared_ptr<FakeStore> backend) : backend_(std::move(backend)) {}
+    bool open(std::string& why) override { return backend_->open(why); }
+    void close() override { backend_->close(); }
+    bool opened() const override { return backend_->opened(); }
+    size_t object_bytes() const override { return backend_->object_bytes(); }
+    int64_t chunk_tokens() const override { return backend_->chunk_tokens(); }
+    bool put_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, const void* data, size_t bytes,
+                    std::string& why, const char* salt) override {
+        return backend_->put_object(tokens, start, end, data, bytes, why, salt);
+    }
+    bool get_object(const std::vector<int32_t>& tokens, int64_t start, int64_t end, std::string& out, bool& present,
+                    std::string& why, const char* salt) override {
+        return backend_->get_object(tokens, start, end, out, present, why, salt);
+    }
+
+private:
+    std::shared_ptr<FakeStore> backend_;
 };
 
 // ---- fixtures --------------------------------------------------------------------------------------------------
@@ -219,7 +261,7 @@ std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
 
 ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed) {
     ConversationCheckpoint c;
-    for (size_t i = 0; i < tokens; ++i) c.ids.push_back(int32_t(1000 + i));
+    for (size_t i = 0; i < tokens; ++i) c.ids.push_back(int32_t(1000 + i + int(seed) * 100000));
     c.imgs = {{3, 0x1234567890abcdefull ^ seed}};
     c.gdn = bytes_of(4099, seed);
     c.ple = bytes_of(77, seed + 1);
@@ -238,28 +280,13 @@ struct Session {
     std::vector<int32_t> tokens;
 };
 
-//: A state whose K/V can be cut at 256 tokens: 4-cell pages, one indexer row per 4 cells, and each buffer a whole
-//: number of bytes per token (32 + 32 + 4 + 4, plus the pooled row's 128) - 200 bytes a token, which is what
-//: test_settings() registers and what FakeStore shapes its objects to.
-constexpr int64_t kPerToken = 400;   // both layers: 2 x (32 + 32 + 4 + 4) plus the two pooled row streams (2 x 128)
-constexpr int64_t kCells = 1024;
-
-Session make_session(size_t tokens, size_t = 0) {
-    Session s;
-    s.image.geometry = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17};
-    s.image.layer_lo = 0;
-    s.image.layer_hi = 48;
-    s.image.cvec = false;
-    s.image.live = checkpoint(int(tokens), 1);   // the engine passes img.live.ids as the conversation's tokens
-    s.image.checkpoints.push_back(checkpoint(8, 2));
-    for (size_t i = 0; i < tokens; ++i) s.tokens.push_back(int32_t((i * 2654435761u) & 0x7fffffffu));
-
-    const int64_t cells = ((int64_t(tokens) + 255) / 256) * 256;   // whole chunks
-    s.parts.resize(2);
+// The fixture's K/V sources read the session's own buffers through a reference to it, so a Session that was moved
+// (into a vector, out of a helper) leaves them pointing at the moved-from object.  A test that keeps several sessions
+// calls this after they are in their final place.
+void rebind(Session& s) {
+    s.kv.clear();
+    const int64_t cells = int64_t(s.parts.empty() ? 0 : s.parts[0][0].size() / 32);
     for (size_t layer = 0; layer < s.parts.size(); ++layer) {
-        const std::array<size_t, 5> sizes = {size_t(cells) * 32, size_t(cells) * 32, size_t(cells) * 4,
-                                             size_t(cells) * 4, size_t(cells / 4 + 1) * 128 * sizeof(float)};
-        for (size_t p = 0; p < 5; ++p) s.parts[layer][p] = bytes_of(sizes[p], uint8_t(layer * 5 + p));
         SessionKvSource src;
         src.format = 2 + int(layer);
         src.cells = cells;
@@ -275,7 +302,47 @@ Session make_session(size_t tokens, size_t = 0) {
         };
         s.kv.push_back(std::move(src));
     }
+}
+
+//: A state whose K/V can be cut at 256 tokens: 4-cell pages, one indexer row per 4 cells, and each buffer a whole
+//: number of bytes per token (32 + 32 + 4 + 4, plus the pooled row's 128) - 200 bytes a token, which is what
+//: test_settings() registers and what FakeStore shapes its objects to.
+constexpr int64_t kPerToken = 400;   // both layers: 2 x (32 + 32 + 4 + 4) plus the two pooled row streams (2 x 128)
+constexpr int64_t kCells = 1024;
+
+// A conversation of `ids`, with buffers derived from `seed`: two sessions of the same length and different seeds are
+// two users' conversations (different tokens, different K/V), which is what the interleaving tests need.
+Session make_session_from(std::vector<int32_t> ids, size_t seed = 0) {
+    Session s;
+    const size_t tokens = ids.size();
+    s.image.geometry = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17};
+    s.image.layer_lo = 0;
+    s.image.layer_hi = 48;
+    s.image.cvec = false;
+    s.image.live = checkpoint(tokens, uint8_t(seed + 1));   // the engine passes img.live.ids as the conversation's tokens
+    s.image.checkpoints.push_back(checkpoint(8, uint8_t(seed + 2)));
+    // A text-only conversation: the picture tests set the image keys they mean (a picture is part of a record's key, so
+    // a fixture that invented one would only ever be read back by a caller that passed it too).
+    s.image.live.imgs.clear();
+    s.image.checkpoints.back().imgs.clear();
+    s.image.live.ids = ids;   // (checkpoint() numbers them; the ids are the conversation's own)
+    s.tokens = std::move(ids);
+
+    const int64_t cells = ((int64_t(tokens) + 255) / 256) * 256;   // whole chunks
+    s.parts.resize(2);
+    for (size_t layer = 0; layer < s.parts.size(); ++layer) {
+        const std::array<size_t, 5> sizes = {size_t(cells) * 32, size_t(cells) * 32, size_t(cells) * 4,
+                                             size_t(cells) * 4, size_t(cells / 4 + 1) * 128 * sizeof(float)};
+        for (size_t p = 0; p < 5; ++p) s.parts[layer][p] = bytes_of(sizes[p], uint8_t(layer * 5 + p + seed * 13));
+    }
+    rebind(s);
     return s;
+}
+
+Session make_session(size_t tokens, size_t seed = 0) {
+    std::vector<int32_t> ids;
+    for (size_t i = 0; i < tokens; ++i) ids.push_back(int32_t((i * 2654435761u + seed * 40503u) & 0x7fffffffu));
+    return make_session_from(std::move(ids), seed);
 }
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
@@ -296,6 +363,17 @@ bool buffer_equals(const ConversationBuffer& b, const std::vector<uint8_t>& v) {
     if (b.size() != v.size()) return false;
     bool ok = true;
     b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t at) {
+        if (std::memcmp(p, v.data() + at, c) != 0) ok = false;
+        return ok;
+    });
+    return ok;
+}
+
+// The first `n` bytes of a buffer against the first `n` of a vector: a restored prefix of a longer conversation.
+bool buffer_prefix_equals(const ConversationBuffer& b, const std::vector<uint8_t>& v, size_t n) {
+    if (b.size() < n || v.size() < n) return false;
+    bool ok = true;
+    b.visit(0, n, [&](const uint8_t* p, size_t c, size_t at) {
         if (std::memcmp(p, v.data() + at, c) != 0) ok = false;
         return ok;
     });
@@ -357,12 +435,12 @@ void only_new_windows_are_sent() {
 
     Session first = make_session(1024);
     check(publish_ok(tier, first, id, "first", why), "the first publish sends the whole state");
-    check(raw->puts == 1 + 4, "one record plus four windows of 256 tokens");
+    check(raw->puts == 1 + 4, "one head record and four windows of 256 tokens");
 
     Session grown = make_session(1280);   // the same conversation, two turns later
     const int before = raw->puts;
     check(publish_ok(tier, grown, id, "grown", why), "the grown conversation publishes");
-    check(raw->puts - before == 1 + 1, "only the record and the new window are sent, not the five already there");
+    check(raw->puts - before == 1 + 1, "the head (rewritten every turn) and the new window, not the four already there");
 
     SavedConversation back;
     check(tier.restore(grown.tokens, id, back, {}, why), "the grown conversation restores");
@@ -440,10 +518,7 @@ void prefix_is_cut_at_chunk_boundaries() {
     std::string why;
     check(publish_ok(tier, s, id, "1000 tokens", why), "a 1000-token session publishes");
     check(raw->max_end == 768, "the stored prefix floors to 768 tokens, never past the last whole chunk");
-    int64_t windows = 0;
-    for (const auto& kv : raw->objects) windows += kv.first.first.empty() ? 1 : 0;
-    check(windows == 3, "three windows of 256 tokens");
-    check(raw->objects.size() == 4, "the record and three windows reached the store");
+    check(raw->objects.size() == 1 + 3, "one head record and three windows of 256 tokens");
 
     SavedConversation back;
     check(tier.restore(s.tokens, id, back, {}, why), "and it restores");
@@ -521,6 +596,198 @@ void disabled_tier_does_nothing() {
     check(!tier.restore(s.tokens, id, out, {}, why), "restore is a no-op");
     same(lmcache_info_line(off, tier.stats()), "lmcache=off\n", "and INFO says so");
 }
+// ---- several users, several conversations, several engines --------------------------------------------------------
+
+bool same_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) { return a == b; }
+
+// A real instance serves several clients at once: an agent's main conversation, a subagent's, a side question, another
+// person's chat.  Their publishes interleave turn by turn, and every turn must read back its OWN state - a shared tier
+// that mixed two conversations up would be worse than no tier at all.
+void users_interleave_on_one_engine() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{21, 22};
+    std::string why;
+
+    const int users = 4;
+    std::vector<Session> live;
+    live.reserve(users);
+    for (int u = 0; u < users; ++u) live.push_back(make_session(1024, size_t(u + 1)));
+    for (auto& s : live) rebind(s);
+
+    for (int turn = 0; turn <= 3; ++turn) {
+        for (int u = 0; u < users; ++u) {
+            const size_t len = 1024 + size_t(turn) * 256;
+            Session grown = make_session(len, size_t(u + 1));   // the same conversation, one turn longer
+            live[size_t(u)] = std::move(grown);
+            rebind(live[size_t(u)]);
+            const Session& now = live[size_t(u)];
+            if (!publish_ok(tier, now, id, "an interleaved turn", why)) {
+                check(false, "every user's turn publishes");
+                continue;
+            }
+            SavedConversation back;
+            const bool ok = tier.restore(now.tokens, id, back, {}, why);
+            check(ok, "every user's turn is read back");
+            if (!ok) continue;
+            check(int64_t(back.live.ids.size()) == int64_t(len), "the turn comes back at its own length");
+            check(back.live.ids == now.tokens, "with that user's tokens");
+            check(back.live.gdn == now.image.live.gdn, "and that user's running state");
+            check(buffer_equals(back.kv[0].k, now.parts[0][0]), "and that user's K/V");
+        }
+    }
+    // four conversations, four turns each: every one of them reached the store, and each window was written once - the
+    // windows of the turns before are still there (4 -> 7 windows per user, not 4+5+6+7)
+    check(tier.stats().published == users * 4, "every turn of every user was published");
+    // every window once, and one head per turn (the head is keyed by the length it covers, so a turn adds one and the
+    // turn before it stays as a shorter, stale head that the TTL takes away)
+    check(raw->objects.size() == size_t(users) * (7 + 4), "each new window once, and one head per turn");
+}
+
+// The deployment runs four engines against one store, and a turn does not come back to the engine that computed it:
+// that is the whole point.  Every publish lands on one instance and every read is made on the other.
+void two_instances_serve_their_own_users() {
+    auto backend = std::make_shared<FakeStore>(kPerToken + 64);
+    LmcacheTier a(test_settings(), std::make_unique<ProxyStore>(backend));
+    LmcacheTier b(test_settings(), std::make_unique<ProxyStore>(backend));
+    const SessionFileIdentity id{31, 32};
+    std::string why;
+
+    std::vector<Session> live;
+    live.reserve(4);
+    for (int u = 0; u < 4; ++u) live.push_back(make_session(1024, size_t(u + 11)));
+    for (auto& s : live) rebind(s);
+
+    for (int turn = 0; turn < 3; ++turn) {
+        for (int u = 0; u < 4; ++u) {
+            const size_t len = 1024 + size_t(turn) * 256;
+            Session grown = make_session(len, size_t(u + 11));
+            live[size_t(u)] = std::move(grown);
+            rebind(live[size_t(u)]);
+            const Session& now = live[size_t(u)];
+            LmcacheTier& owner = (u % 2 == 0) ? a : b;
+            LmcacheTier& other = (u % 2 == 0) ? b : a;
+            if (!owner.publish(now.image, now.kv, now.tokens, id, why)) {
+                check(false, "a turn publishes on the instance that computed it");
+                continue;
+            }
+            SavedConversation back;
+            const bool ok = other.restore(now.tokens, id, back, {}, why);
+            check(ok, "the other instance reads the turn back");
+            if (!ok) continue;
+            check(same_state(now.image, back), "and gets that user's state, not another's");
+            check(buffer_equals(back.kv[0].k, now.parts[0][0]), "with that user's K/V");
+        }
+    }
+}
+
+// A picture is a run of placeholder tokens: two users who send the same words with different screenshots produce the
+// SAME token ids and DIFFERENT K/V.  One key cannot hold both (the store keeps the first object it was given), so the
+// second conversation's state is simply not stored - and every reader must then refuse it.  That refusal is the
+// caller's check (conversation_prefix: same pictures, same steering), which this exercises end to end.
+void a_picture_is_never_served_for_another_picture() {
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{41, 42};
+    std::string why;
+
+    Session mine = make_session(1024, 1);
+    Session yours = make_session(1024, 1);
+    rebind(mine);
+    rebind(yours);
+    mine.image.live.imgs = {{3, 0xaaaa0001ull}};
+    yours.image.live.imgs = {{3, 0xbbbb0002ull}};
+    for (size_t p = 0; p < 5; ++p) yours.parts[0][p] = bytes_of(yours.parts[0][p].size(), uint8_t(0x60 + p));
+    rebind(yours);
+    check(mine.tokens == yours.tokens, "the two prompts have the same token ids");
+    check(!same_bytes(mine.parts[0][0], yours.parts[0][0]), "and the pictures make their K/V differ");
+
+    check(publish_ok(tier, mine, id, "the first picture", why), "the first picture's conversation publishes");
+    check(publish_ok(tier, yours, id, "the second picture", why), "the second publishes over it (the store keeps the first)");
+    check(raw->objects.size() == 1 + 4, "one head and four windows: the store holds one state for these ids, not two");
+
+    SavedConversation back;
+    check(tier.restore(yours.tokens, id, back, {}, why), "the ids are in the store, so the read succeeds");
+    check(back.live.imgs == mine.image.live.imgs, "and it says which picture it was computed for");
+    // The next turn of each conversation: the restored prefix is shorter than its prompt, as it always is in practice.
+    std::vector<int32_t> next = yours.tokens;
+    next.push_back(777);
+    check(conversation_prefix(back.live, next, mine.image.live.imgs) == 1024,
+          "the first picture's caller accepts it");
+    check(conversation_prefix(back.live, next, yours.image.live.imgs) == 0,
+          "the second picture's caller refuses it - recomputes instead of using another picture's state");
+}
+
+// The stored prefix cuts at a whole chunk, so a picture before that cut is part of the state and one after it is not:
+// the caller's own check (conversation_prefix, which this exercises) must follow the same line.
+void a_picture_inside_the_prefix_gates_the_match() {
+    Session s = make_session(1200, 3);   // 4 windows stored: the state covers 1024 tokens
+    s.image.live.imgs = {{3, 0x1111ull}, {900, 0x2222ull}, {1100, 0x3333ull}};
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{43, 44};
+    std::string why;
+    check(publish_ok(tier, s, id, "a session with pictures", why), "a session with pictures publishes");
+
+    SavedConversation back;
+    check(tier.restore(s.tokens, id, back, {}, why), "and restores");
+    check(back.live.ids.size() == 1024, "as the 1024-token prefix it stored");
+    check(back.live.imgs == std::vector<ConversationImageKey>{{3, 0x1111ull}, {900, 0x2222ull}},
+          "carrying the pictures inside that prefix (and not the one past it)");
+    check(conversation_prefix(back.live, s.tokens, {{3, 0x1111ull}, {900, 0x2222ull}}) == 1024,
+          "the state matches a prompt with the same pictures");
+
+    // Another picture at 900 - inside the restored state - means the K/V there is not the caller's: no match.
+    std::vector<ConversationImageKey> other_inside = {{3, 0x1111ull}, {900, 0x9999ull}};
+    check(conversation_prefix(back.live, s.tokens, other_inside) == 0,
+          "a different picture inside the prefix refuses the match");
+
+    // A different picture at 1100 - past the restored prefix - changes nothing: that state never covered it.
+    std::vector<ConversationImageKey> other_after = {{3, 0x1111ull}, {900, 0x2222ull}, {1100, 0x7777ull}};
+    check(conversation_prefix(back.live, s.tokens, other_after) == 1024,
+          "a picture past the stored prefix does not");
+}
+
+// An agent pastes the same long file twice with two different questions.  The file's windows are the same objects, so
+// the second question must restore them instead of reading the file again - and never send them a second time.
+void a_long_file_prefix_is_shared_by_two_questions() {
+    std::vector<int32_t> file;
+    file.reserve(4136);
+    for (int i = 0; i < 4096; ++i) file.push_back(int32_t((i * 2654435761u) & 0x7fffffff));
+    std::vector<int32_t> q1 = file, q2 = file;
+    for (int i = 0; i < 40; ++i) {
+        q1.push_back(int32_t(900000 + i));
+        q2.push_back(int32_t(800000 + i));
+    }
+    Session a = make_session_from(q1, 5);
+    Session b = make_session_from(q2, 5);
+    rebind(a);
+    rebind(b);
+
+    auto store = std::make_unique<FakeStore>(kPerToken + 64);
+    FakeStore* raw = store.get();
+    LmcacheTier tier(test_settings(), std::move(store));
+    const SessionFileIdentity id{45, 46};
+    std::string why;
+    check(publish_ok(tier, a, id, "the first question", why), "the first question publishes the file's windows");
+    check(raw->objects.size() == 1 + 16, "one head and sixteen windows of the file");
+
+    const int before = raw->puts;
+    check(publish_ok(tier, b, id, "the second question", why), "the second question publishes");
+    check(raw->puts - before == 1, "only the head it shares with the file: its windows are already there");
+
+    SavedConversation back;
+    check(tier.restore(b.tokens, id, back, {}, why), "the second question restores");
+    check(back.live.ids == file, "as the file's own prefix, not the first question's tail");
+    check(conversation_prefix(back.live, b.tokens, {}) == 4096, "which is a prefix of the second prompt");
+    check(buffer_prefix_equals(back.kv[0].k, a.parts[0][0], 4096 * 32),
+          "with the K/V of the file the first turn computed");
+}
+
+
+
 // ---- against a real store, when an endpoint is given ------------------------------------------------------------
 
 int live(const std::string& endpoint) {
@@ -589,7 +856,7 @@ int live(const std::string& endpoint) {
         g.min_tokens = 8192;
         LmcacheTier gated(g, lmcache_zmq_store(g.rpc, g.model, g.bytes_per_token, 9920));
         const SessionFileIdentity bid{0xaaaabbbbccccddddull, 0x1111222233334444ull};
-        Session big = make_session(9216);   // 36 whole chunks: the fixture's cells and live ids stay consistent
+        Session big = make_session(9216, 7);   // 36 whole chunks (its own opening, so no other fixture shadows it)
         if (!gated.publish(big.image, big.kv, big.tokens, bid, why)) {
             std::fprintf(stderr, "live gated publish: %s\n", why.c_str());
             return 2;
@@ -605,6 +872,96 @@ int live(const std::string& endpoint) {
         check(!gated.restore(small.tokens, bid, none, {}, why), "live: 8000 tokens is below the 8192 gate");
         check(why.find("cost gate") != std::string::npos, "live: the gate names itself");
     }
+    // Two users, the same words, two different screenshots: the same token ids, another K/V, and therefore another
+    // salt.  The store must keep them apart - this is the case the picture key exists for.
+    {
+        LmcacheSettings ls = s;
+        ls.min_tokens = 512;
+        LmcacheTier apt(ls, lmcache_zmq_store(ls.rpc, ls.model, ls.bytes_per_token, 9940));
+        LmcacheTier bpt(ls, lmcache_zmq_store(ls.rpc, ls.model, ls.bytes_per_token, 9941));
+        LmcacheTier cpt(ls, lmcache_zmq_store(ls.rpc, ls.model, ls.bytes_per_token, 9942));
+        const SessionFileIdentity pid{0x1111222233334444ull, 0x5555666677778888ull};
+        Session first = make_session(1024, 31);
+        Session second = make_session(1024, 31);
+        rebind(first);
+        rebind(second);
+        first.image.live.imgs = {{3, 0xa1a1a1a1a1a1a1a1ull}};
+        second.image.live.imgs = {{3, 0xb2b2b2b2b2b2b2b2ull}};
+        for (size_t p = 0; p < 5; ++p) second.parts[0][p] = bytes_of(second.parts[0][p].size(), uint8_t(0x70 + p));
+        rebind(second);
+        if (!apt.publish(first.image, first.kv, first.tokens, pid, why)) {
+            std::fprintf(stderr, "live pictures publish 1: %s\n", why.c_str());
+            return 2;
+        }
+        if (!bpt.publish(second.image, second.kv, second.tokens, pid, why)) {
+            std::fprintf(stderr, "live pictures publish 2: %s\n", why.c_str());
+            return 2;
+        }
+        SavedConversation got;
+        if (!cpt.restore(first.tokens, pid, got, {}, why)) {   // a third engine reads what the two wrote
+            std::fprintf(stderr, "live pictures restore: %s\n", why.c_str());
+            return 2;
+        }
+        // One of the two states is in the store (the store keeps the first object it was given) and the state says
+        // which picture it was computed for; the other caller's check refuses it, so no one is ever served the wrong
+        // picture's K/V.
+        const bool is_first = got.live.imgs == first.image.live.imgs;
+        check(is_first || got.live.imgs == second.image.live.imgs, "live: the state names the picture it was made for");
+        check(is_first ? buffer_equals(got.kv[0].k, first.parts[0][0])
+                       : buffer_equals(got.kv[0].k, second.parts[0][0]),
+              "live: and its bytes are that picture's");
+        const Session& other_pic = is_first ? second : first;
+        check(conversation_prefix(got.live, other_pic.tokens, other_pic.image.live.imgs) == 0,
+              "live: the other picture's caller refuses it");
+    }
+
+    // The deployment's real shape: more than one engine, more than one user per engine, and pictures among the turns.
+    // A turn computed on one engine is read on another, with the request's own pictures in the key.
+    {
+        LmcacheSettings ls = s;
+        ls.min_tokens = 512;
+        LmcacheTier e0(ls, lmcache_zmq_store(ls.rpc, ls.model, ls.bytes_per_token, 9930));
+        LmcacheTier e1(ls, lmcache_zmq_store(ls.rpc, ls.model, ls.bytes_per_token, 9931));
+        const SessionFileIdentity uid{0x0102030405060708ull, 0x090a0b0c0d0e0f10ull};
+        std::vector<Session> users;
+        users.reserve(3);
+        for (int u = 0; u < 3; ++u) users.push_back(make_session(1024, size_t(u + 21)));
+        for (int u = 0; u < 3; ++u) {
+            rebind(users[size_t(u)]);
+            users[size_t(u)].image.live.imgs = {{3, 0x5000000000000000ull + uint64_t(u)}};   // one screenshot each
+        }
+        int read_ok = 0;
+        for (int turn = 0; turn < 2; ++turn) {
+            for (int u = 0; u < 3; ++u) {
+                const size_t len = 1024 + size_t(turn) * 256;
+                Session grown = make_session(len, size_t(u + 21));
+                grown.image.live.imgs = {{3, 0x5000000000000000ull + uint64_t(u)}};
+                users[size_t(u)] = std::move(grown);
+                rebind(users[size_t(u)]);
+                const Session& now = users[size_t(u)];
+                LmcacheTier& owner = (u % 2 == 0) ? e0 : e1;
+                LmcacheTier& other = (u % 2 == 0) ? e1 : e0;
+                if (!owner.publish(now.image, now.kv, now.tokens, uid, why)) {
+                    std::fprintf(stderr, "live interleaved publish (user %d, turn %d): %s\n", u, turn, why.c_str());
+                    return 2;
+                }
+                SavedConversation got;
+                if (!other.restore(now.tokens, uid, got, {}, why)) {
+                    std::fprintf(stderr, "live interleaved restore (user %d, turn %d): %s\n", u, turn, why.c_str());
+                    return 2;
+                }
+                if (!got.live.ids.empty() && got.live.ids == now.tokens && buffer_equals(got.kv[0].k, now.parts[0][0]))
+                    ++read_ok;
+            }
+        }
+        check(read_ok == 6, "live: six turns of three users on two engines all came back on the other engine");
+
+        // A conversation nobody published is a miss, never another user's state.
+        Session stranger = make_session(1024, 99);
+        SavedConversation none;
+        check(!e0.restore(stranger.tokens, uid, none, {}, why), "live: an unpublished conversation misses");
+    }
+
     const auto& st = tier.stats();
     std::printf("live: published=%lld (%lld MiB) restored=%lld (%lld MiB) hit=%lld failed=%lld last_ms=%lld\n",
                 (long long) st.published, (long long) (st.published_bytes >> 20), (long long) st.restored,
@@ -626,6 +983,11 @@ int main(int argc, char** argv) {
     a_miss_is_not_an_error();
     another_identity_is_refused();
     disabled_tier_does_nothing();
+    users_interleave_on_one_engine();
+    two_instances_serve_their_own_users();
+    a_picture_is_never_served_for_another_picture();
+    a_picture_inside_the_prefix_gates_the_match();
+    a_long_file_prefix_is_shared_by_two_questions();
     int rc = 0;
     if (argc > 1) rc = live(argv[1]);
     std::printf("lmcache_tier_test: %d checks, %d failed\n", checks, failures);

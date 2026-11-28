@@ -91,10 +91,43 @@ std::string lmcache_info_line(const LmcacheSettings& s, const LmcacheStats& st) 
 // ---- the tier: one conversation <-> a chain of chunk objects ----------------------------------------------------
 namespace {
 
-// One record = one image serialized in the session format.  A published conversation is a handful of them: a META
-// record (its tokens, checkpoints and running state) and one record per 256-token window of K/V.  Each record is the
-// same format a session file has, so the hash, the identity and the limits all come for free; what changes is the
-// composition, and that is what makes a growing conversation cheap: its first windows are already in the store.
+// The head is its own object, and it must not share a key with any window: the store resolves a key's token range into
+// one object per chunk (a record can never span two) and keeps the first object it was given for a key, so two records
+// over one range are one record - the second is dropped and the first is what everybody reads.  Its range is therefore
+// [0, chunk) like the first window, and the two are told apart by the only thing this store certainly hashes: the
+// tokens.  The head's key stream is the conversation's first chunk with its opening tokens replaced by a digest of the
+// length and of the whole prefix; no prompt produces that stream, so the head can never be confused with a window or
+// with another turn's head.
+std::vector<int32_t> head_key_tokens(const std::vector<int32_t>& tokens, int64_t end, int64_t chunk) {
+    const size_t n = std::min<size_t>(size_t(std::max<int64_t>(end, 0)), tokens.size());
+    std::vector<int32_t> key(size_t(std::max<int64_t>(chunk, 0)), 0);
+    std::copy(tokens.begin(), tokens.begin() + (std::ptrdiff_t) std::min<size_t>(n, key.size()), key.begin());
+    SessionHasher h(0x686561646b6579ull);   // "headkey"
+    h.update(&end, sizeof end);
+    h.update(tokens.data(), n * sizeof(int32_t));
+    const uint64_t d = h.digest();
+    if (key.size() > 0) key[0] = int32_t(uint32_t(d));
+    if (key.size() > 1) key[1] = int32_t(uint32_t(d >> 32));
+    if (key.size() > 2) key[2] = int32_t(uint32_t(d * 0x9e3779b1u));
+    if (key.size() > 3) key[3] = 0x48454144;   // "HEAD": a head's key, never a prompt's own stream
+    return key;
+}
+
+// One record = one image serialized in the session format.  A published conversation is a handful of them: a HEAD
+// record (its tokens, checkpoints and running state, together with the first window's K/V) and one record per further
+// 256-token window of K/V.
+//
+// The head rides in the first window's record because of a hard rule of the store: a key's token range is resolved
+// into one object per chunk and the commit must carry exactly that many tensors, so a record can never span more than
+// one chunk - and two records may never share one, either.  The store keeps the first object it was given for a key
+// and its lookup does not reliably separate two records over the same range by their cache_salt (two records over
+// [0, 256) came back as each other in testing).  Giving the head its own range is therefore impossible, and folding it
+// into the first window's record costs one object per turn: the head changes on every turn, so the first window is
+// written again while the others are not.
+//
+// Each record is the same format a session file has, so the hash, the identity and the limits all come for free; what
+// changes is the composition, and that is what makes a growing conversation cheap: its earlier windows stay in the
+// store.
 class RamSink : public SessionSink {
 public:
     bool ok() const override { return true; }
@@ -232,11 +265,11 @@ bool LmcacheTier::publish_impl(const SavedConversation& image, const std::vector
     }
     const int64_t total = chunk_windows(tokens, chunk);
     const auto t0 = std::chrono::steady_clock::now();
-    // 1. the record that makes the windows add up to a conversation: its tokens, checkpoints and running state.  It is
-    //    rewritten on every publish (it is small) and it is what a reader looks for first.
+    // 1. the head: the conversation's tokens, checkpoints and running state, in one small object of its own (see
+    //    head_key_tokens).  It is rewritten on every publish, because it grows with the conversation.
     {
-        SavedConversation meta = image;
-        for (ConversationKv& k : meta.kv) {
+        SavedConversation head = image;
+        for (ConversationKv& k : head.kv) {
             k.k = ConversationBuffer{};
             k.v = ConversationBuffer{};
             k.k_scale = ConversationBuffer{};
@@ -245,10 +278,12 @@ bool LmcacheTier::publish_impl(const SavedConversation& image, const std::vector
             k.cells = 0;
             k.pooled_rows = 0;
         }
-        // The meta record's key follows the conversation's length, not a fixed [0, chunk): the store never replaces
-        // an object it already has, so a key pinned to the first chunk would freeze the running state, the tokens
-        // and the identity at the first publish and every longer turn would read that stale record back.
-        if (!put_record(*store_, meta, nullptr, tokens, 0, total * chunk, "meta", id, why)) {
+        head.live.ids = image.live.ids;
+        head.live.ids.resize(size_t(total * chunk));   // what this publish covers, whole windows only
+        for (auto it = head.live.imgs.begin(); it != head.live.imgs.end();)
+            it = it->start >= total * chunk ? head.live.imgs.erase(it) : it + 1;
+        const std::vector<int32_t> hkey = head_key_tokens(tokens, total * chunk, chunk);
+        if (!put_record(*store_, head, nullptr, hkey, 0, chunk, nullptr, id, why)) {
             ++stats_.failed;
             stats_.connected = false;
             return false;
@@ -268,7 +303,7 @@ bool LmcacheTier::publish_impl(const SavedConversation& image, const std::vector
             stats_.connected = false;
             return false;
         }
-        if (!put_record(*store_, piece, nullptr, tokens, window.first, window.first + chunk, "", id, why)) {
+        if (!put_record(*store_, piece, nullptr, tokens, window.first, window.first + chunk, nullptr, id, why)) {
             ++stats_.failed;
             stats_.connected = false;
             return false;
@@ -287,8 +322,8 @@ bool LmcacheTier::publish_impl(const SavedConversation& image, const std::vector
 
 int64_t LmcacheTier::published_windows(const std::vector<int32_t>& tokens, int64_t chunk) const {
     for (auto it = published_.rbegin(); it != published_.rend(); ++it) {
-        if (it->ids.size() <= tokens.size() && std::equal(it->ids.begin(), it->ids.end(), tokens.begin()))
-            return std::min(it->windows, int64_t(tokens.size()) / chunk);
+        if (it->ids.size() > tokens.size() || !std::equal(it->ids.begin(), it->ids.end(), tokens.begin())) continue;
+        return std::min(it->windows, int64_t(tokens.size()) / chunk);
     }
     return 0;
 }
@@ -296,13 +331,21 @@ int64_t LmcacheTier::published_windows(const std::vector<int32_t>& tokens, int64
 void LmcacheTier::remember_published(const std::vector<int32_t>& tokens, int64_t windows, int64_t chunk) {
     const size_t held = std::min(tokens.size(), size_t(std::max<int64_t>(windows, 0) * chunk));
     for (auto it = published_.begin(); it != published_.end(); ++it) {
-        if (it->ids.size() == held && std::equal(it->ids.begin(), it->ids.end(), tokens.begin())) {
+        // The same conversation, now as long or longer: the entry follows it rather than piling a second one up, so
+        // one conversation keeps one entry no matter how many turns it takes.
+        if (it->ids.size() <= held && std::equal(it->ids.begin(), it->ids.end(), tokens.begin())) {
+            if (held > it->ids.size()) it->ids.assign(tokens.begin(), tokens.begin() + (std::ptrdiff_t) held);
             it->windows = std::max(it->windows, windows);
             return;
         }
     }
-    published_.push_back(Published{std::vector<int32_t>(tokens.begin(), tokens.begin() + held), windows});
-    while (published_.size() > 2) published_.erase(published_.begin());   // the two conversations in flight, at most
+    published_.push_back(Published{std::vector<int32_t>(tokens.begin(), tokens.begin() + (std::ptrdiff_t) held), windows});
+    // One instance serves several conversations at once (an agent's main thread, its subagents, another person's chat),
+    // and a conversation only grows: forgetting one after two others means its next turn re-sends every window it
+    // already has - the whole state, on every turn, which is what the cutting up exists to avoid.  Eight is more than
+    // the RAM tier's four parked slots, and each entry is only the tokens of the windows it covers (a 200 K-token
+    // conversation: 800 KB).
+    while (published_.size() > 8) published_.erase(published_.begin());
 }
 
 bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, SavedConversation& out,
@@ -317,6 +360,7 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
     // is far below the gate - probes the store, and a store that does not answer costs the caller the whole lookup
     // timeout before the prefill can start.  Below the gate a transfer could never pay for the read it saves anyway.
     if (int64_t(tokens.size()) < settings_.min_tokens) {
+        ++stats_.rejected;
         why = "prefix of " + std::to_string(tokens.size()) + " tokens is below the cost gate (" +
               std::to_string(settings_.min_tokens) + ")";
         return false;
@@ -328,41 +372,74 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
     }
     const int64_t chunk = store_->chunk_tokens();
     const auto t0 = std::chrono::steady_clock::now();
-    // 1. the conversation's own record.  Without it the windows are just bytes: it holds the tokens, the checkpoints
-    //    and the running state they belong to.
-    SavedConversation meta;
+    // 1. the head: the conversation's tokens, checkpoints and running state (see head_key_tokens).  Its length says how
+    //    many windows follow, so one lookup decides both "is it there" and "how much of it" - after walking the lengths
+    //    down, since the head of a shorter turn has another key.
+    SavedConversation head;
     bool present = false;
-    // The meta record is keyed by the conversation's length (see publish): the store keeps the first object it was
-    // given for a key, so a key pinned to the first chunk would freeze the running state, the tokens and the identity
-    // at the first publish.  This prompt is at least as long as the one that was published, so walk the whole-chunk
-    // lengths down until the record is found.  A miss costs one lookup; a store that does not answer returns above.
+    int64_t total = 0;
     const int64_t want = (int64_t(tokens.size()) / chunk) * chunk;
-    int64_t meta_end = 0;
     for (int64_t end = want, tries = 0; end >= chunk && tries < 8; end -= chunk, ++tries) {
-        if (!get_record(*store_, tokens, 0, end, "meta", id, limits, meta, present, why)) {
+        const std::vector<int32_t> hkey = head_key_tokens(tokens, end, chunk);
+        if (!get_record(*store_, hkey, 0, chunk, nullptr, id, limits, head, present, why)) {
             ++stats_.failed;
             stats_.connected = false;
             return false;
         }
-        if (present) { meta_end = end; break; }
+        if (present) {
+            total = end / chunk;
+            break;
+        }
     }
-    if (!present || meta_end == 0) {
+    if (!present || total <= 0) {
         stats_.connected = true;   // the store answered: it simply does not have this prefix
         why = "no session for this prefix";
         return false;
     }
-    const int64_t total = meta_end / chunk;
-    if (total <= 0) {
+    if (int64_t(head.live.ids.size()) != total * chunk) {
         stats_.connected = true;
-        why = "the store's record holds no whole chunk";
+        why = "the head does not cover the length it was found under";
         return false;
     }
-    // 2. every window.  The record's running state belongs to the whole conversation, so a chain that lost one window
-    //    is not a shorter session - it is an unusable one (a partial chain is refused, exactly as before the split).
+    // The store's own key is the prompt's chunk hashes, and a head covers the whole conversation while its key covers
+    // one chunk: two conversations that open with the same 256 tokens can therefore be handed each other's head.  The
+    // head carries the tokens it belongs to, so this is where that is refused - a miss (recompute) and never another
+    // conversation's state.
+    if (!std::equal(head.live.ids.begin(), head.live.ids.end(), tokens.begin())) {
+        stats_.connected = true;
+        why = "the head belongs to another conversation with the same opening tokens";
+        return false;
+    }
+    // 2. the first window: it gives the image its shape, and loses the head's running state onto it.
+    SavedConversation first;
+    if (!get_record(*store_, tokens, 0, chunk, nullptr, id, limits, first, present, why)) {
+        ++stats_.failed;
+        stats_.connected = false;
+        return false;
+    }
+    if (!present) {
+        stats_.connected = true;
+        why = "the store is missing window 0 of " + std::to_string(total);
+        return false;
+    }
     SavedConversation image;
-    for (int64_t i = 0; i < total; ++i) {
+    if (!chunk_reserve(image, first, total * chunk, why)) {
+        ++stats_.failed;
+        stats_.connected = false;
+        return false;
+    }
+    image.live = head.live;
+    image.checkpoints = head.checkpoints;
+    if (!chunk_merge(image, first, ChunkWindow{0, chunk}, why)) {
+        ++stats_.failed;
+        stats_.connected = false;
+        return false;
+    }
+    // 3. every further window.  A chain that lost one is not a shorter session - it is an unusable one, because the
+    //    head's running arrays belong to the whole conversation.
+    for (int64_t i = 1; i < total; ++i) {
         SavedConversation piece;
-        if (!get_record(*store_, tokens, i * chunk, (i + 1) * chunk, "", id, limits, piece, present, why)) {
+        if (!get_record(*store_, tokens, i * chunk, (i + 1) * chunk, nullptr, id, limits, piece, present, why)) {
             ++stats_.failed;
             stats_.connected = false;
             return false;
@@ -371,16 +448,6 @@ bool LmcacheTier::restore(const std::vector<int32_t>& tokens, const SessionFileI
             stats_.connected = true;
             why = "the store is missing window " + std::to_string(i) + " of " + std::to_string(total);
             return false;
-        }
-        if (i == 0) {
-            if (!chunk_reserve(image, piece, total * chunk, why)) {
-                ++stats_.failed;
-                stats_.connected = false;
-                return false;
-            }
-            image.live = meta.live;
-            image.live.ids.resize(size_t(total * chunk));
-            image.checkpoints = meta.checkpoints;
         }
         if (!chunk_merge(image, piece, ChunkWindow{i * chunk, chunk}, why)) {
             ++stats_.failed;

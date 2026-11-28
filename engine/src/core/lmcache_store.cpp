@@ -235,7 +235,11 @@ private:
         key.cache_salt = salt ? salt : "";
         key.start = start;
         key.end = end;
-        key.request_id = "strata";
+        // LMCache keeps one session per request_id, and the session carries the state of a transfer in flight (the
+        // store's prefetch bookkeeping).  One constant id for every transfer of every engine made those sessions
+        // collide: a read that followed another engine's write came back "the store has the object but would not
+        // serve it".  The id is not part of the cache identity, so a fresh one per transfer costs nothing.
+        key.request_id = "strata-" + std::to_string(instance_) + "-" + std::to_string(next_request_++);
         key.num_kv_readers = 1;
         // lmcache hashes the whole prefix up to `end` and selects [start, end) from it: the token bytes are the prefix,
         // not just this chunk (IPCCacheServerKey.from_token_ids does the same)
@@ -247,6 +251,7 @@ private:
     std::string endpoint_, model_;
     int64_t per_token_;
     int64_t instance_;
+    mutable uint64_t next_request_ = 1;   // make_key's transfer id: one per put/get, never reused
     Dealer dealer_;
     Rpc rpc_;
     bool open_ = false, opening_ = false;

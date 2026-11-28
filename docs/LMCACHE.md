@@ -151,29 +151,45 @@ carries the same row (see "In the monitor").
 ## What is stored, and how
 
 A conversation is addressed by **its token prefix**, the same identity LMCache uses for any engine
-(`IPCCacheServerKey`: model, token bytes, `[start, end)`), and its state is stored as a chain of objects, one per
-`chunk_size` tokens (256 by default):
+(`IPCCacheServerKey`: model, token bytes, `[start, end)`), and its state is stored as one **head record** plus one
+record per `chunk_size` tokens (256 by default):
 
 ```
-key   = (namespace, tokens[0:end], end)          end = floor(tokens / 256) * 256
-object i = 256 tokens of state (256 x bytes_per_token bytes), i in [0, end/256)
+head       key = (namespace, tokens[0:256), [0, 256))          -> tokens, checkpoints, running state
+window i   key = (namespace, tokens[0:(i+1)*256), [i*256, (i+1)*256))  -> the K/V of those 256 tokens
 ```
 
-`bytes_per_token` is the engine's real state size (~19 KB/token at this geometry: GDN recurrence, convolution history,
-QSA pages and the draft layer), registered once as the store's `hidden_dim_size` with `dtype_str=uint8` and
-`use_mla=true`. lmcache validates every object against that shape, so a truncated or foreign payload is rejected by the
-store rather than restored as garbage.
+`bytes_per_token` is the engine's real K/V size per token (~19 KB/token at this geometry), registered once as the
+store's `hidden_dim_size` with `dtype_str=uint8` and `use_mla=true`. LMCache validates every object against that shape,
+so a truncated or foreign payload is rejected by the store rather than restored as garbage.
+
+The layout follows from three rules of the store, each of which was found the hard way:
+
+* **One record is one object.** A key's token range is resolved into one object per chunk and the commit must carry
+  exactly that many tensors, so a record may never span two chunks. This is why the head is a separate small record and
+  not a prefix of the state.
+* **The first write wins.** The store never replaces an object it already has, so a key that does not change holds the
+  first bytes ever written for it. The head is therefore keyed by the length it covers (a longer turn writes another
+  head) and the windows are written once, by the first publish that reaches them.
+* **Two records may not share a range.** The store does not reliably separate two records over the same `[start, end)`
+  by `cache_salt` (two records over `[0, 256)` came back as each other on 0.5.7), so the head gets its own key stream -
+  the first chunk with its opening tokens replaced by a digest of the length and of the whole prefix - and no prompt can
+  ever produce it.
 
 Consequences worth knowing:
 
 * **A resume point floors to a chunk boundary.** Strata's continuation point is a turn boundary, which is almost never a
-  multiple of 256; the tier publishes `floor(tokens/256)*256` and the first at most 255 tokens are recomputed. At
-  19 KB/token that is a few MB of work against a 1.2 GB restore.
-* **Objects are individually addressed**, so a partial hit is usable: the store answers how many of the objects for a
-  prefix it holds, and only the missing tail is recomputed.
-* **A manifest object is written last.** It names the objects and the exact byte length, so a reader can never see a
-  half-published session: either the manifest is there and every object it names is committed, or the session does not
-  exist.
+  multiple of 256; the tier publishes `floor(tokens/256)*256` and the first at most 255 tokens are recomputed.
+* **A turn moves one head plus its new windows.** Appending 2 K tokens to a 200 K-token conversation writes one head and
+  nine windows, not 780 objects.
+* **The head says which conversation it belongs to.** Its tokens travel inside it and the reader compares them with the
+  prompt's: a store that hands over another conversation's head (two conversations that open with the same 256 tokens)
+  is refused, and the prompt is recomputed - never restored from someone else's state.
+* **Pictures ride in the tokens.** An image is a run of placeholder tokens, so two requests with the same text and
+  different screenshots have the same ids and different K/V. They share one cache entry (the store cannot hold two under
+  one prefix), and the engine's own reuse check - same pictures, same steering - then refuses a state that was computed
+  for another picture. The answer is always right; the second conversation simply does not get the reuse. Files need
+  nothing here: their text is in the ids, so a different file is a different prefix.
 
 ## What it costs
 

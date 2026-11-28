@@ -94,7 +94,8 @@ public:
                  const std::vector<int32_t>& tokens, const SessionFileIdentity& id, std::string& why);
 
     // Read a session back.  False + `why` for "the store has no session for this prefix" as well as for a real error;
-    // `out` is untouched unless the whole stream was restored and validated.
+    // `out` is untouched unless the whole stream was restored and validated.  A state that was computed for other
+    // pictures is refused by the caller's own check (conversation_prefix), not here.
     bool restore(const std::vector<int32_t>& tokens, const SessionFileIdentity& id, SavedConversation& out,
                  const SessionReadLimits& limits, std::string& why);
 
@@ -111,7 +112,7 @@ private:
     };
     int64_t published_windows(const std::vector<int32_t>& tokens, int64_t chunk) const;
     void remember_published(const std::vector<int32_t>& tokens, int64_t windows, int64_t chunk);
-    std::vector<Published> published_;   // the most recent two conversations, oldest first
+    std::vector<Published> published_;   // the conversations in flight, least recently published first
 
     LmcacheSettings settings_;
     std::unique_ptr<LmcacheStore> store_;
