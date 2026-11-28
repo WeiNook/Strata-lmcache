@@ -21,9 +21,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (for example 0.2.18-lmcache.2)'
+        description: 'Image tag (for example 0.2.18-lmcache.3)'
         required: true
-        default: '0.2.18-lmcache.2'
+        default: '0.2.18-lmcache.3'
         type: string
       cuda_architectures:
         description: 'CUDA architectures: 86 = A10/A40, 89 = RTX 40, 120 = RTX 50; empty = all five (much slower)'
